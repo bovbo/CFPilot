@@ -571,6 +571,244 @@ index 0000000..71da24c
 +		t.Fatalf("POST 发出后失败被重试了 %d 次", n)
 +	}
 +}
+diff --git a/packages/desktop/internal/deploy/dataonly_test.go b/packages/desktop/internal/deploy/dataonly_test.go
+new file mode 100644
+index 0000000..40521aa
+--- /dev/null
++++ b/packages/desktop/internal/deploy/dataonly_test.go
+@@ -0,0 +1,144 @@
++package deploy
++
++// 「仅数据面」部署（1:N 多数据面：每个账号只放一个数据面 Worker）的规则测试。
++//
++// 重点是「不碰控制面」和「不越界覆盖」两条：
++//   - 不创建、不配置（PATCH）、不部署控制面；
++//   - 清单属于另一个实例时，fresh 仍被归属校验拒绝；
++//   - 更新完整实例时，清单里的控制面信息原样保留。
++
++import (
++	"context"
++	"strings"
++	"testing"
++	"time"
++)
++
++func dataOnlyOpts(o *Options) {
++	o.DataOnly = true
++	o.ControlScript = nil
++	o.Mode = "auto"
++	o.LocalBuild = "new-build"
++	o.WaitTimeout = 2 * time.Second
++	o.WaitInterval = 10 * time.Millisecond
++}
++
++func TestDataOnlyFirstDeploy(t *testing.T) {
++	f := newFakeCF()
++	d, _ := newTestDeployer(t, f, dataOnlyOpts)
++
++	res, err := d.Run(context.Background())
++	if err != nil {
++		t.Fatalf("仅数据面首次部署失败：%v", err)
++	}
++	if res.Data.Name == "" {
++		t.Error("应生成数据面项目名")
++	}
++	if res.Control.Name != "" {
++		t.Errorf("仅数据面不该生成控制面项目名，实际 %q", res.Control.Name)
++	}
++	if len(f.created) != 1 || f.created[0] != res.Data.Name {
++		t.Errorf("只应创建数据面一个项目，实际 %v", f.created)
++	}
++	if len(f.deployOrder) != 1 || f.deployOrder[0] != res.Data.Name {
++		t.Errorf("只应部署数据面，实际 %v", f.deployOrder)
++	}
++	raw := f.kvWrites["CFP_DEPLOY_MANIFEST"]
++	if raw == "" {
++		t.Fatal("仅数据面部署也必须写入部署清单（后续更新与「读取部署」靠它）")
++	}
++	if !strings.Contains(raw, `"controlProject": ""`) {
++		t.Errorf("清单里控制面应为空串，实际：%s", raw)
++	}
++	if !strings.Contains(raw, res.Data.Name) {
++		t.Errorf("清单里应有数据面项目名：%s", raw)
++	}
++	if f.kvWrites["CONFIG"] == "" {
++		t.Error("应写入大写 CONFIG")
++	}
++}
++
++func TestDataOnlyUpdateKeepsOwnCredentialsAndName(t *testing.T) {
++	f := newFakeCF()
++	f.kvSeed["CFP_DEPLOY_MANIFEST"] = `{
++		"v": 1, "controlProject": "", "dataProject": "dp-existing",
++		"build": "old-build", "at": "2026-11-01T00:00:00.000Z",
++		"credentials": {"uuid":"KEEP-UUID","wsPath":"/keep-ws","panelPath":"/p","panelPassword":"pw","trojanPassword":"tp"}
++	}`
++	d, _ := newTestDeployer(t, f, dataOnlyOpts)
++
++	res, err := d.Run(context.Background())
++	if err != nil {
++		t.Fatalf("纯数据面清单应判为本实例、原地更新：%v", err)
++	}
++	if res.Data.Name != "dp-existing" {
++		t.Errorf("应复用清单里的数据面项目名，实际 %q", res.Data.Name)
++	}
++	if res.UUID != "KEEP-UUID" {
++		t.Errorf("应沿用 UUID（订阅里的节点不变），实际 %q", res.UUID)
++	}
++	if len(f.created) > 1 {
++		t.Errorf("不该创建控制面，实际创建 %v", f.created)
++	}
++	for _, n := range f.deployOrder {
++		if n != "dp-existing" {
++			t.Errorf("只应部署数据面，却部署了 %q", n)
++		}
++	}
++}
++
++func TestDataOnlyUpdateOfFullInstanceDoesNotTouchControl(t *testing.T) {
++	f := newFakeCF()
++	f.kvSeed["CFP_DEPLOY_MANIFEST"] = `{
++		"v": 1, "controlProject": "ctl-live", "dataProject": "dp-live",
++		"controlSubdomain": "ctl-live.pages.dev", "dataSubdomain": "dp-live.pages.dev",
++		"build": "old-build", "at": "2026-11-01T00:00:00.000Z",
++		"credentials": {"uuid":"U","wsPath":"/w","panelPath":"/p","panelPassword":"pw","trojanPassword":"tp"}
++	}`
++	d, _ := newTestDeployer(t, f, dataOnlyOpts)
++
++	if _, err := d.Run(context.Background()); err != nil {
++		t.Fatalf("更新完整实例的数据面不该被拒：%v", err)
++	}
++	for _, n := range f.deployOrder {
++		if n == "ctl-live" {
++			t.Error("仅数据面更新绝不能部署控制面")
++		}
++	}
++	if f.patchCalls["ctl-live"] != 0 {
++		t.Errorf("绝不能 PATCH 控制面（会触发隐式部署），实际 %d 次", f.patchCalls["ctl-live"])
++	}
++	raw := f.kvWrites["CFP_DEPLOY_MANIFEST"]
++	if !strings.Contains(raw, `"controlProject": "ctl-live"`) {
++		t.Errorf("清单里的控制面信息必须原样保留：%s", raw)
++	}
++}
++
++func TestDataOnlyFreshRejectedWhenManifestExists(t *testing.T) {
++	f := newFakeCF()
++	f.kvSeed["CFP_DEPLOY_MANIFEST"] = `{
++		"v": 1, "controlProject": "ctl-live", "dataProject": "dp-live",
++		"build": "b", "at": "2026-11-01T00:00:00.000Z", "credentials": {"uuid":"U"}
++	}`
++	d, _ := newTestDeployer(t, f, func(o *Options) {
++		dataOnlyOpts(o)
++		o.Mode = "fresh"
++	})
++	if _, err := d.Run(context.Background()); err == nil {
++		t.Fatal("fresh 遇到已有实例必须被归属校验拒绝，不能越界覆盖")
++	}
++	if len(f.deployOrder) != 0 || len(f.kvWrites) != 0 {
++		t.Errorf("被拒后不该有任何部署或写入：部署 %v，写入 %v", f.deployOrder, f.kvWrites)
++	}
++}
++
++func TestDataOnlyStillRequiresDataScript(t *testing.T) {
++	f := newFakeCF()
++	d, _ := newTestDeployer(t, f, func(o *Options) {
++		dataOnlyOpts(o)
++		o.DataScript = nil
++	})
++	if _, err := d.Run(context.Background()); err == nil {
++		t.Fatal("数据面产物为空必须报错")
++	}
++}
+diff --git a/packages/desktop/internal/deploy/deploy.go b/packages/desktop/internal/deploy/deploy.go
+index 3eed2ee..e783f6b 100644
+--- a/packages/desktop/internal/deploy/deploy.go
++++ b/packages/desktop/internal/deploy/deploy.go
+@@ -75,6 +75,15 @@ type Options struct {
+ 	// 空串 = **沿用清单里记录的形态**（没有清单则 pages）。
+ 	// 与「显式传 pages」不同：后者对 Workers 实例来说是一次形态切换。
+ 	DataPlaneMode string
++	// DataOnly 只部署数据面：不创建 / 不配置 / 不部署控制面（1:N 多数据面用，
++	// 各账号只放一个数据面 Worker，控制面只有一个）。
++	//
++	// 安全约定：
++	//   - 账号里没有清单 → 首次部署，清单里的控制面项目名为空串；
++	//   - 清单是「纯数据面」（控制面为空）→ 原地更新；
++	//   - 清单属于完整实例（有控制面）且是自动模式 → 只更新数据面，不碰控制面；
++	//   - 指定了 fresh 而清单已存在 → 仍按归属校验拒绝（不会越界覆盖）。
++	DataOnly bool
+ 	// KeepCredentials 更新时沿用清单里的 UUID / WS 路径（默认 true）
+ 	KeepCredentials bool
+ 	// SkipSameVersion 本地版本与线上一致时跳过部署（默认 true）
+@@ -364,7 +373,7 @@ func (d *Deployer) Run(ctx context.Context) (*Result, error) {
+ 	// 空串会被误判成 owned → 「全新部署」复用同一个 KV 时，
+ 	// 会把另一个现役实例的清单认成自己的 → 用新凭据覆盖 CONFIG
+ 	// → 老实例的客户端节点全部失效（跨账户串号）。
+-	if controlName == "" {
++	if controlName == "" && !d.opt.DataOnly {
+ 		controlName = RandomWorkerName()
+ 	}
+ 	if dataName == "" {
+@@ -466,14 +475,16 @@ func (d *Deployer) Run(ctx context.Context) (*Result, error) {
+ 		d.setSlotSubdomain(label, proj.Subdomain)
+ 	}
+ 
+-	ensurePagesProject("控制面", controlName)
++	if !d.opt.DataOnly {
++		ensurePagesProject("控制面", controlName)
++	}
+ 	if dataMode == "pages" {
+ 		ensurePagesProject("数据面", dataName)
+ 	} else {
+ 		d.log("· 数据面部署形态：Workers（不创建 Pages 数据面项目）")
+ 	}
+ 	// ---------------- 2. 配置环境变量与 KV（必须在部署前） ----------------
+-	if d.result.Control.Subdomain != "" {
++	if d.result.Control.Subdomain != "" && !d.opt.DataOnly {
+ 		d.configureProject(ctx, controlName, "控制面", eff)
+ 	}
+ 	if dataMode == "pages" && d.result.Data.Subdomain != "" {
+@@ -598,24 +609,25 @@ func (d *Deployer) Run(ctx context.Context) (*Result, error) {
+ 	// 控制面的环境变量是**部署前**配好的，那时 DATA_HOST 还是旧域名。
+ 	// 数据面因 8000119 换名重建后域名变了 → 控制面 DATA_HOST 仍指向
+ 	// **已删除的旧域名** → 订阅里 sni/host 全部指向不存在的域名 → 所有节点失效。
+-	if d.result.Data.Subdomain != "" && d.result.Control.Name != "" {
++	if d.result.Data.Subdomain != "" && d.result.Control.Name != "" && !d.opt.DataOnly {
+ 		d.syncControlDataHost(ctx, eff)
+ 	}
+ 
+ 	// ---------------- 3b. 部署控制面 ----------------
+-	controlAttempt := d.deployOnce(ctx, deployAttemptParams{
++	if d.opt.DataOnly {
++		d.log("· 仅数据面模式：不部署控制面")
++	} else if controlAttempt := d.deployOnce(ctx, deployAttemptParams{
+ 		preferredName: controlName,
+ 		code:          d.opt.ControlScript,
+ 		label:         "控制面",
+ 		eff:           eff,
+-	})
+-	if controlAttempt != nil {
++	}); controlAttempt != nil {
+ 		d.result.Control.Name = controlAttempt.project
+ 		d.result.Control.Subdomain = controlAttempt.subdomain
+ 	}
+ 
+ 	// ---------------- 4. 写回部署清单 ----------------
+-	if d.result.Control.Subdomain != "" && d.result.Data.Subdomain != "" {
++	if (d.result.Control.Subdomain != "" || d.opt.DataOnly) && d.result.Data.Subdomain != "" {
+ 		if err := d.writeManifest(ctx, manifest, eff, dataCustomDomain); err != nil {
+ 			d.warn("写入部署清单失败：" + err.Error())
+ 		} else {
+@@ -639,7 +651,7 @@ func (d *Deployer) validate() error {
+ 	if strings.TrimSpace(d.opt.KVNamespaceID) == "" {
+ 		problems = append(problems, "缺少 KV 命名空间 ID")
+ 	}
+-	if len(d.opt.ControlScript) == 0 {
++	if len(d.opt.ControlScript) == 0 && !d.opt.DataOnly {
+ 		problems = append(problems, "控制面产物为空（control.js）")
+ 	}
+ 	if len(d.opt.DataScript) == 0 {
 diff --git a/packages/desktop/internal/dpreg/dpreg.go b/packages/desktop/internal/dpreg/dpreg.go
 new file mode 100644
 index 0000000..29cdc5e
@@ -1327,6 +1565,389 @@ index 3d83f4c..771c0a9 100644
  }
  
  // Run 执行三阶扫描。
+diff --git a/packages/desktop/internal/server/dp_deploy.go b/packages/desktop/internal/server/dp_deploy.go
+new file mode 100644
+index 0000000..0a2e2ea
+--- /dev/null
++++ b/packages/desktop/internal/server/dp_deploy.go
+@@ -0,0 +1,287 @@
++package server
++
++// 1:N 多数据面：各账号独立部署 / 升级数据面（第 3 阶段）。
++//
++//	POST /api/dp/deploy   部署或升级一个或多个数据面（异步；进度走日志，结果走 dp-deploy 事件）
++//
++// ## 设计约束
++//
++// 1. **每个数据面用它自己所属账号的凭据**（store.Profile），绝不借用「当前活跃账号」，
++//    也不会把一个账号的 Token / KV 用到另一个账号上。
++// 2. **只部署数据面**（deploy.Options.DataOnly）：不创建、不配置、不部署控制面。
++//    账号里已经是完整实例时，也只更新它的数据面，清单里的控制面信息原样保留。
++// 3. **逐个串行，失败互不影响**：一个数据面失败只记在它自己名下，其余继续；
++//    不做任何自动重试（连续重试会累积账号风控画像，见 deploy.deployOnce 的说明），
++//    相邻两次部署之间固定间隔，避免短时间内对多个账号集中发布。
++// 4. 与「部署」页共用同一把部署锁：同一时刻只允许一个部署在跑。
++// 5. 成功后把域名 / UUID / 路径回读进注册表并同步控制面，订阅聚合立即生效。
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"strings"
++	"time"
++
++	"github.com/xmwengxing/cfpilot/packages/desktop/internal/deploy"
++	"github.com/xmwengxing/cfpilot/packages/desktop/internal/dpreg"
++	"github.com/xmwengxing/cfpilot/packages/desktop/internal/safe"
++)
++
++// dpDeployGap 是相邻两个数据面部署之间的固定间隔。
++const dpDeployGap = 8 * time.Second
++
++type dpDeployReq struct {
++	// IDs 为空 = 全部启用的数据面。
++	IDs []string `json:"ids"`
++	// Force 对应「强制重新部署」：忽略「线上版本与本地相同则跳过」。
++	Force bool `json:"force"`
++	// DataPlaneMode：pages / workers；留空 = 沿用账号里已部署的形态（没有则 pages）。
++	DataPlaneMode string `json:"dataPlaneMode"`
++}
++
++// dpDeployResult 是单个数据面的部署结果。
++type dpDeployResult struct {
++	ID            string   `json:"id"`
++	Name          string   `json:"name"`
++	OK            bool     `json:"ok"`
++	Skipped       bool     `json:"skipped"`
++	Message       string   `json:"message"`
++	Warnings      []string `json:"warnings,omitempty"`
++	KernelVersion string   `json:"kernelVersion,omitempty"`
++}
++
++func (s *Server) handleDPDeploy(w http.ResponseWriter, r *http.Request) {
++	var req dpDeployReq
++	if !dpDecode(w, r, &req) {
++		return
++	}
++	st := s.dpStore()
++
++	// 选出要部署的数据面
++	var targets []dpreg.DataPlane
++	if len(req.IDs) == 0 {
++		for _, p := range st.List() {
++			if p.Enabled {
++				targets = append(targets, p)
++			}
++		}
++	} else {
++		seen := map[string]bool{}
++		for _, id := range req.IDs {
++			if seen[id] {
++				continue
++			}
++			seen[id] = true
++			p, ok := st.Get(id)
++			if !ok {
++				writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "数据面不存在：" + id})
++				return
++			}
++			targets = append(targets, p)
++		}
++	}
++	if len(targets) == 0 {
++		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "没有可部署的数据面（都已停用或还没添加）"})
++		return
++	}
++
++	// 开始前先把每个数据面的前置条件查清楚，缺什么一次说完（缺条件的不会被部署，也不影响其它）。
++	var blocked []string
++	for _, p := range targets {
++		if msg := s.dpDeployPrecheck(p); msg != "" {
++			blocked = append(blocked, (p.Name + "：" + msg))
++		}
++	}
++	if len(blocked) == len(targets) {
++		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": strings.Join(blocked, "\n")})
++		return
++	}
++
++	loadCtx, cancelLoad := context.WithTimeout(context.Background(), 90*time.Second)
++	artifacts, err := s.loadKernelArtifacts(loadCtx)
++	cancelLoad()
++	if err != nil {
++		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
++		return
++	}
++
++	s.deploy.mu.Lock()
++	if s.deploy.running {
++		s.deploy.mu.Unlock()
++		writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": "已有部署正在进行，请等待完成"})
++		return
++	}
++	s.deploy.running = true
++	s.deploy.mu.Unlock()
++
++	plane := strings.ToLower(strings.TrimSpace(req.DataPlaneMode))
++	if plane != "pages" && plane != "workers" {
++		plane = ""
++	}
++
++	go func() {
++		defer func() {
++			s.deploy.mu.Lock()
++			s.deploy.running = false
++			s.deploy.mu.Unlock()
++		}()
++		defer func() {
++			if r := safe.Recover("数据面部署任务"); r != nil {
++				s.logLevel("数据面部署过程发生内部错误，详情已记入日志（服务继续运行）", "err")
++			}
++		}()
++
++		results := make([]dpDeployResult, 0, len(targets))
++		first := true
++		for _, p := range targets {
++			if msg := s.dpDeployPrecheck(p); msg != "" {
++				s.logLevel("[数据面 "+p.Name+"] 跳过："+msg, "warn")
++				results = append(results, dpDeployResult{ID: p.ID, Name: p.Name, Message: "已跳过：" + msg})
++				continue
++			}
++			if !first {
++				time.Sleep(dpDeployGap)
++			}
++			first = false
++			res := s.dpDeployOne(p, artifacts.Data, artifacts.Build, artifacts.Version, plane, req.Force)
++			results = append(results, res)
++		}
++
++		// 一次性同步注册表到控制面（订阅聚合马上用上新的域名 / UUID / 路径）
++		sctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
++		if err := s.dpSyncRegistry(sctx); err != nil {
++			s.logLevel("数据面已部署，但同步控制面失败（下次推送时会重试）："+err.Error(), "warn")
++		}
++		cancel()
++
++		okN := 0
++		for _, x := range results {
++			if x.OK {
++				okN++
++			}
++		}
++		s.logLevel(fmt.Sprintf("数据面部署结束：成功 %d / 共 %d", okN, len(results)), map[bool]string{true: "ok", false: "warn"}[okN == len(results)])
++		if s.events != nil {
++			s.events.publish("dp-deploy", map[string]any{"at": time.Now().UnixMilli(), "results": results})
++		}
++	}()
++
++	writeJSON(w, http.StatusOK, map[string]any{
++		"ok": true, "started": true, "count": len(targets), "skippedPrecheck": blocked,
++		"note": "部署已开始，逐个数据面串行执行，进度见运行日志",
++	})
++}
++
++// dpDeployPrecheck 返回空串表示可部署；否则返回缺什么。
++func (s *Server) dpDeployPrecheck(p dpreg.DataPlane) string {
++	profile, err := s.store.Get(p.ProfileID)
++	if err != nil || profile == nil {
++		return "所属账号不存在"
++	}
++	if strings.TrimSpace(profile.CfToken) == "" {
++		return "该账号缺少 API Token"
++	}
++	if strings.TrimSpace(profile.AccountID) == "" {
++		return "该账号缺少 Account ID（请先在凭据页检测账号）"
++	}
++	if strings.TrimSpace(profile.KVNamespaceID) == "" {
++		return "该账号还没有选 KV（请先在凭据页选择或新建 KV）"
++	}
++	return ""
++}
++
++// dpDeployOne 部署（或升级）一个数据面。绝不 panic、不重试；失败只返回在结果里。
++func (s *Server) dpDeployOne(p dpreg.DataPlane, dataScript []byte, build, kernelVersion, plane string, force bool) dpDeployResult {
++	out := dpDeployResult{ID: p.ID, Name: p.Name}
++	tag := "[数据面 " + p.Name + "] "
++
++	profile, err := s.store.Get(p.ProfileID)
++	if err != nil || profile == nil {
++		out.Message = "所属账号不存在"
++		return out
++	}
++
++	opt := deploy.DefaultOptions()
++	opt.Token = profile.CfToken
++	opt.AccountID = profile.AccountID
++	opt.KVNamespaceID = profile.KVNamespaceID
++	opt.DataScript = dataScript
++	opt.DataOnly = true
++	opt.Mode = "auto"
++	opt.DataProject = strings.TrimSpace(p.WorkerName)
++	// 已有身份就带上：重新部署后节点的 UUID / 路径不变，订阅里的老节点继续可用
++	opt.UUID = strings.TrimSpace(p.UUID)
++	opt.WSPath = strings.TrimSpace(p.WSPath)
++	opt.TrojanPassword = strings.TrimSpace(p.TrojanPassword)
++	if plane != "" {
++		opt.DataPlaneMode = plane
++	}
++	if opt.DataPlaneMode == "workers" {
++		opt.DataHost = strings.TrimSpace(p.Domain)
++	}
++	opt.PanelPassword = strings.TrimSpace(profile.DeployPanelPassword)
++	opt.LocalBuild = build
++	opt.LocalKernelVersion = kernelVersion
++	opt.KeepCredentials = true
++	opt.SkipSameVersion = !force
++	opt.Log = func(m string) { s.logf(tag + m) }
++	opt.ClaimWrites = s.claimDailyWrite
++
++	s.logf(tag + "开始部署 / 升级（账号：" + profile.Name + "）")
++	res, runErr := deploy.New(opt).Run(context.Background())
++	if runErr != nil {
++		out.Message = runErr.Error()
++		s.logLevel(tag+"失败："+runErr.Error(), "err")
++		return out
++	}
++	for _, warn := range res.Warnings {
++		out.Warnings = append(out.Warnings, warn)
++		s.logLevel(tag+"⚠ "+warn, "warn")
++	}
++	if res.Skipped {
++		out.OK, out.Skipped = true, true
++		out.Message = "线上已是最新版本，跳过"
++		out.KernelVersion = kernelVersion
++		s.logLevel(tag+out.Message, "ok")
++		return out
++	}
++	if strings.TrimSpace(res.Data.Subdomain) == "" {
++		out.Message = "数据面部署没有确认成功（详见上面的警告）"
++		s.logLevel(tag+out.Message, "err")
++		return out
++	}
++
++	// 回读：只补空字段，不覆盖你填过的域名（Workers 的自定义域名由你在控制台绑定）
++	rctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
++	defer cancel()
++	cur, ok := s.dpStore().Get(p.ID)
++	if !ok {
++		out.OK = true
++		out.Message = "部署完成（数据面已被删除，未回读）"
++		return out
++	}
++	if res.Data.Name != "" && strings.TrimSpace(cur.WorkerName) == "" {
++		cur.WorkerName = res.Data.Name
++	}
++	if err := s.dpReadDeploy(rctx, &cur, false); err != nil {
++		out.OK = true
++		out.Message = "部署完成，但回读部署清单失败：" + err.Error()
++		s.logLevel(tag+out.Message, "warn")
++		return out
++	}
++	if _, err := s.dpStore().Upsert(cur); err != nil {
++		out.OK = true
++		out.Message = "部署完成，但写入注册表失败：" + err.Error()
++		s.logLevel(tag+out.Message, "warn")
++		return out
++	}
++	out.OK = true
++	out.KernelVersion = cur.KernelVersion
++	out.Message = "部署完成"
++	if cur.Domain == "" {
++		out.Message += "（还没有域名：Workers 形态请到 Cloudflare 控制台给它绑定自定义域名，再回「编辑」里填上）"
++	}
++	s.logLevel(tag+out.Message, "ok")
++	return out
++}
+diff --git a/packages/desktop/internal/server/dp_deploy_test.go b/packages/desktop/internal/server/dp_deploy_test.go
+new file mode 100644
+index 0000000..a1605fd
+--- /dev/null
++++ b/packages/desktop/internal/server/dp_deploy_test.go
+@@ -0,0 +1,84 @@
++package server
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/xmwengxing/cfpilot/packages/desktop/internal/dpreg"
++	"github.com/xmwengxing/cfpilot/packages/desktop/internal/store"
++)
++
++func postJSONTo(h http.HandlerFunc, body string) (int, map[string]any) {
++	req := httptest.NewRequest(http.MethodPost, "/api/dp/deploy", strings.NewReader(body))
++	rec := httptest.NewRecorder()
++	h(rec, req)
++	var out map[string]any
++	_ = json.Unmarshal(rec.Body.Bytes(), &out)
++	return rec.Code, out
++}
++
++func TestDPDeployPrecheckReportsWhatIsMissing(t *testing.T) {
++	st := newEmptyStore(t)
++	s := &Server{store: st}
++
++	if msg := s.dpDeployPrecheck(dpreg.DataPlane{ProfileID: "nope"}); !strings.Contains(msg, "账号不存在") {
++		t.Errorf("账号不存在应提示，实际 %q", msg)
++	}
++
++	p, err := st.Create("B", &store.Profile{CfToken: "tok"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if msg := s.dpDeployPrecheck(dpreg.DataPlane{ProfileID: p.ID}); !strings.Contains(msg, "Account ID") {
++		t.Errorf("缺 Account ID 应提示，实际 %q", msg)
++	}
++	acc := "acc"
++	if _, err := st.Update(p.ID, store.Patch{AccountID: &acc}); err != nil {
++		t.Fatal(err)
++	}
++	if msg := s.dpDeployPrecheck(dpreg.DataPlane{ProfileID: p.ID}); !strings.Contains(msg, "KV") {
++		t.Errorf("缺 KV 应提示，实际 %q", msg)
++	}
++	kv := "kv1"
++	if _, err := st.Update(p.ID, store.Patch{KVNamespaceID: &kv}); err != nil {
++		t.Fatal(err)
++	}
++	if msg := s.dpDeployPrecheck(dpreg.DataPlane{ProfileID: p.ID}); msg != "" {
++		t.Errorf("条件齐全不该报缺项，实际 %q", msg)
++	}
++}
++
++// 全部数据面都缺条件 → 直接报错，不起后台任务、不占部署锁。
++func TestDPDeployAllBlockedStartsNothing(t *testing.T) {
++	st := newEmptyStore(t)
++	s := &Server{store: st}
++	if _, err := s.dpStore().Upsert(dpreg.DataPlane{ID: "a", Name: "A", ProfileID: "missing", Domain: "a.example.com", UUID: "11111111-1111-4111-8111-111111111111", WSPath: "/ws", Enabled: true}); err != nil {
++		t.Fatal(err)
++	}
++	code, out := postJSONTo(s.handleDPDeploy, `{"ids":["a"]}`)
++	if code != http.StatusOK || out["ok"] != false {
++		t.Fatalf("应返回 ok=false：%d %v", code, out)
++	}
++	if e, _ := out["error"].(string); !strings.Contains(e, "A") || !strings.Contains(e, "账号不存在") {
++		t.Errorf("错误应点名数据面与原因，实际 %q", e)
++	}
++	s.deploy.mu.Lock()
++	running := s.deploy.running
++	s.deploy.mu.Unlock()
++	if running {
++		t.Error("没有可部署的数据面时不该占用部署锁")
++	}
++}
++
++func TestDPDeployUnknownIDAndEmptyList(t *testing.T) {
++	s := &Server{store: newEmptyStore(t)}
++	if _, out := postJSONTo(s.handleDPDeploy, `{"ids":["zzz"]}`); out["ok"] != false {
++		t.Errorf("不存在的数据面应报错：%v", out)
++	}
++	if _, out := postJSONTo(s.handleDPDeploy, `{"ids":[]}`); out["ok"] != false {
++		t.Errorf("没有任何数据面应报错：%v", out)
++	}
++}
 diff --git a/packages/desktop/internal/server/dp_push.go b/packages/desktop/internal/server/dp_push.go
 new file mode 100644
 index 0000000..bde71b2
@@ -1753,10 +2374,10 @@ index 0000000..bde71b2
 +}
 diff --git a/packages/desktop/internal/server/dp_routes.go b/packages/desktop/internal/server/dp_routes.go
 new file mode 100644
-index 0000000..e5eaf98
+index 0000000..83eb9dd
 --- /dev/null
 +++ b/packages/desktop/internal/server/dp_routes.go
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,394 @@
 +package server
 +
 +// 1:N 多数据面管理接口。
@@ -1768,6 +2389,7 @@ index 0000000..e5eaf98
 +//	POST /api/dp/push            手动推送（异步；结果见各数据面的推送记录）
 +//	POST /api/dp/ips/remove      从某个数据面的池里删除指定 IP
 +//	POST /api/dp/settings        保存全局推送设置
++//	POST /api/dp/deploy          各账号独立部署 / 升级数据面（仅数据面，逐个串行，见 dp_deploy.go）
 +
 +import (
 +	"context"
@@ -1790,6 +2412,7 @@ index 0000000..e5eaf98
 +	mux.HandleFunc("/api/dp/push", s.guard(s.handleDPPush))
 +	mux.HandleFunc("/api/dp/ips/remove", s.guard(s.handleDPRemoveIPs))
 +	mux.HandleFunc("/api/dp/settings", s.guard(s.handleDPSettings))
++	mux.HandleFunc("/api/dp/deploy", s.guard(s.handleDPDeploy))
 +}
 +
 +func dpDecode(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -2422,10 +3045,31 @@ index fca8211..9a0524e 100644
  	s.registerRelayRoutes(mux)
  
 diff --git a/packages/desktop/webui/adapter.js b/packages/desktop/webui/adapter.js
-index 083bb9c..888e7ae 100644
+index b33d874..8fd9ef5 100644
 --- a/packages/desktop/webui/adapter.js
 +++ b/packages/desktop/webui/adapter.js
-@@ -548,8 +548,8 @@
+@@ -203,9 +203,9 @@
+   /**
+    * 各事件的订阅者列表。
+    *
+-   * ⚠️ 这里必须与后端 `s.events.publish(...)` 的**全部 8 个事件**一一对应：
++   * ⚠️ 这里必须与后端 `s.events.publish(...)` 的**全部 10 个事件**一一对应：
+    * deploy-status / log / relay-progress / relay-result / scan-result /
+-   * task-status / update-done / update-progress。
++   * task-status / update-done / update-progress / dp-push / dp-deploy。
+    *
+    * 漏一个键的后果（2026-11-05 真机）：relay-result / relay-progress 没声明，
+    * 界面启动调 onRelayResult / onRelayProgress 时 subscribe() 里的
+@@ -225,6 +225,8 @@
+     'update-progress': [],
+     'update-done': [],
+     'task-status': [],
++    'dp-push': [],
++    'dp-deploy': [],
+   }
+ 
+   let es = null
+@@ -548,8 +550,8 @@
            if (settled) return
            settled = true
            unsub()
@@ -2436,11 +3080,795 @@ index 083bb9c..888e7ae 100644
  
          post('/api/scan/run', params || {}).catch(function (err) {
            if (settled) return
+@@ -775,6 +777,40 @@
+       return post('/api/scan/quick')
+     },
+ 
++    /* ---------------- 1:N 多数据面（数据面管理页） ---------------- */
++
++    /** 数据面清单 + 全局设置 + 账号列表；withPools 为真时顺带查各数据面在控制面的池条数 */
++    dpList: function (withPools) {
++      return get('/api/dp' + (withPools ? '?pools=1' : ''))
++    },
++    /** 新增 / 更新一个数据面（id 为空 = 新增） */
++    dpSave: function (plane) {
++      return post('/api/dp/save', plane || {})
++    },
++    dpDelete: function (id) {
++      return post('/api/dp/delete', { id: id })
++    },
++    /** 从该数据面所属账号的部署清单重新读取域名 / UUID / 路径 */
++    dpSyncDeploy: function (id) {
++      return post('/api/dp/sync-deploy', { id: id })
++    },
++    /** 手动推送：ids 为空 = 全部启用的数据面；mode 空 = 用全局设置；lines 空 = 用最近一次优选结果 */
++    dpPush: function (ids, mode, lines) {
++      return post('/api/dp/push', { ids: ids || [], mode: mode || '', lines: lines || [] })
++    },
++    /** 只从某一个数据面的池里删除指定 IP */
++    dpRemoveIps: function (id, ips) {
++      return post('/api/dp/ips/remove', { id: id, ips: ips || [] })
++    },
++    dpSettings: function (settings) {
++      return post('/api/dp/settings', settings || {})
++    },
++    /** 各账号独立部署 / 升级数据面（仅数据面；ids 为空 = 全部启用的；逐个串行，失败互不影响） */
++    dpDeploy: function (ids, opts) {
++      opts = opts || {}
++      return post('/api/dp/deploy', { ids: ids || [], force: !!opts.force, dataPlaneMode: opts.dataPlaneMode || '' })
++    },
++
+     /* ---------------- 外部 IP 数据源（Phase 5） ---------------- */
+ 
+     /** 数据源配置 + 池统计 + 定时器状态，一次取齐 */
+@@ -1199,6 +1235,16 @@
+       return subscribe('update-done', cb)
+     },
+ 
++    /** 一轮多数据面推送结束（数据面页据此自动刷新记录） */
++    onDpPush: function (cb) {
++      return subscribe('dp-push', cb)
++    },
++
++    /** 数据面部署 / 升级结束（带每个数据面的结果） */
++    onDpDeploy: function (cb) {
++      return subscribe('dp-deploy', cb)
++    },
++
+     /** 定时优选任务的状态变化（运行中 / 完成 / 失败） */
+     onTaskStatus: function (cb) {
+       return subscribe('task-status', cb)
+diff --git a/packages/ui/src/dp-page.ts b/packages/ui/src/dp-page.ts
+new file mode 100644
+index 0000000..4f30b35
+--- /dev/null
++++ b/packages/ui/src/dp-page.ts
+@@ -0,0 +1,439 @@
++/**
++ * 「🛰️ 数据面」页：1:N 多数据面管理。
++ *
++ * 独立成模块的原因：
++ * 1. 这一页只依赖 window.cfpilot.dp* 这组接口，和其它页没有共享状态；
++ * 2. 与上游 renderer.ts 的耦合只有三处（导入、切页时懒加载、启动时绑定），
++ *    上游改 renderer.ts 时不容易冲突。
++ *
++ * 全部写入都走本机后端（/api/dp*），后端负责：
++ *   - 凭据（Token / Account ID / KV）只留在本机，不进控制面；
++ *   - 每个数据面各自验证、各自重试、各自记录，一个失败不影响其它。
++ */
++import { escapeHtml } from './task-rows'
++
++export interface DpPageDeps {
++  log: (message: string, level?: 'info' | 'ok' | 'warn' | 'err') => void
++}
++
++function el<T extends HTMLElement = HTMLElement>(id: string): T {
++  return document.getElementById(id) as T
++}
++
++function fmtTime(ms: number): string {
++  if (!ms) return '—'
++  const d = new Date(ms)
++  const p = (n: number): string => String(n).padStart(2, '0')
++  return `${d.getMonth() + 1}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
++}
++
++const REASON: Record<string, string> = {
++  scan: '优选完成', schedule: '定时任务', add: '新增后', manual: '手动',
++}
++const MODE: Record<string, string> = { append: '追加', replace: '替换', remove: '删除' }
++const STATUS: Record<string, string> = { ok: '成功', failed: '失败', skipped: '跳过' }
++
++function statusBadge(status: string): string {
++  const cls = status === 'ok' ? 'ok' : status === 'failed' ? 'err' : 'info'
++  return `<span class="badge ${cls}">${escapeHtml(STATUS[status] || status || '—')}</span>`
++}
++
++/** 绑定整页交互。返回「切到本页时懒加载」的函数。 */
++export function bindDpPage(deps: DpPageDeps): () => void {
++  let data: DpListResult | null = null
++  let loaded = false
++  let pollTimer: number | null = null
++
++  const log = deps.log
++
++  function planeById(id: string): DpPlaneView | undefined {
++    return data?.planes.find((p) => p.id === id)
++  }
++
++  function profileLabel(id: string): string {
++    const p = data?.profiles.find((x) => x.id === id)
++    if (!p) return '（账号已不存在）'
++    return p.name + (p.accountName ? '（' + p.accountName + '）' : '')
++  }
++
++  /* ---------------- 加载与渲染 ---------------- */
++
++  async function load(withPools: boolean): Promise<void> {
++    try {
++      const r = await window.cfpilot.dpList(withPools)
++      if (!r || !r.ok) {
++        log('数据面清单加载失败：' + ((r && r.error) || '未知错误'), 'err')
++        return
++      }
++      data = r
++      loaded = true
++      renderAll()
++      if (r.poolError) log('读取各数据面池条数失败：' + r.poolError, 'warn')
++    } catch (e) {
++      log('数据面清单加载失败：' + (e instanceof Error ? e.message : String(e)), 'err')
++    }
++  }
++
++  function renderAll(): void {
++    if (!data) return
++    renderSettings()
++    renderTable()
++    renderLogPick()
++    renderFixed()
++    el('dpBadge').textContent = data.planes.length + ' 个数据面'
++    el('dpPushState').textContent = data.pushing ? '正在推送…' : ''
++  }
++
++  function renderSettings(): void {
++    if (!data) return
++    const s = data.settings
++    const sel = el<HTMLSelectElement>('dpCtlProfile')
++    const keep = s.controlProfileId || ''
++    sel.innerHTML = '<option value="">当前活跃账号</option>' + data.profiles.map((p) =>
++      `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name + (p.accountName ? '（' + p.accountName + '）' : ''))}</option>`).join('')
++    sel.value = keep
++    el<HTMLSelectElement>('dpMode').value = s.mode === 'replace' ? 'replace' : 'append'
++    el<HTMLInputElement>('dpTop').value = String(s.top || 15)
++    el<HTMLInputElement>('dpPushAfterAdd').checked = !!s.pushAfterAdd
++    el<HTMLInputElement>('dpPushAfterScan').checked = !!s.pushAfterScan
++  }
++
++  function lastRecord(p: DpPlaneView): DpPushRecordView | null {
++    return p.log && p.log.length ? p.log[p.log.length - 1]! : null
++  }
++
++  function renderTable(): void {
++    if (!data) return
++    const body = el('dpBody')
++    const table = el('dpTable')
++    const empty = el('dpEmpty')
++    if (data.planes.length === 0) {
++      table.hidden = true
++      empty.hidden = false
++      body.innerHTML = ''
++      return
++    }
++    table.hidden = false
++    empty.hidden = true
++    body.innerHTML = data.planes.map((p) => {
++      const last = lastRecord(p)
++      const pool = data!.pools && p.id in data!.pools ? String(data!.pools[p.id]) : '—'
++      const lastHtml = last
++        ? statusBadge(last.status) + ' <span class="tip" style="margin:0">' +
++          escapeHtml(fmtTime(last.at) + ' · ' + (MODE[last.mode] || last.mode) +
++            (last.message ? ' · ' + last.message : '')) + '</span>'
++        : '<span class="tip" style="margin:0">还没推送过</span>'
++      const state = (p.enabled ? '<span class="badge ok">启用</span>' : '<span class="badge info">停用</span>') +
++        (p.autoPush ? '' : ' <span class="badge info">不自动推送</span>')
++      return '<tr data-id="' + escapeHtml(p.id) + '">' +
++        '<td>' + escapeHtml(p.name || p.id) + '</td>' +
++        '<td>' + escapeHtml(profileLabel(p.profileId)) + '</td>' +
++        '<td>' + escapeHtml(p.domain || '—') + '</td>' +
++        '<td>' + state + '</td>' +
++        '<td>' + escapeHtml(pool) + '</td>' +
++        '<td>' + lastHtml + '</td>' +
++        '<td>' + escapeHtml(p.kernelVersion || '—') + '</td>' +
++        '<td style="white-space:nowrap">' +
++        '<button class="btn btn-ghost btn-sm" data-act="deploy" type="button">部署 / 升级</button> ' +
++        '<button class="btn btn-ghost btn-sm" data-act="push" type="button">追加推送</button> ' +
++        '<button class="btn btn-ghost btn-sm" data-act="replace" type="button">替换推送</button> ' +
++        '<button class="btn btn-ghost btn-sm" data-act="sync" type="button">读取部署</button> ' +
++        '<button class="btn btn-ghost btn-sm" data-act="edit" type="button">编辑</button> ' +
++        '<button class="btn btn-ghost btn-sm" data-act="del" type="button">删除</button>' +
++        '</td></tr>'
++    }).join('')
++  }
++
++  function renderLogPick(): void {
++    if (!data) return
++    const sel = el<HTMLSelectElement>('dpLogPick')
++    const cur = sel.value
++    sel.innerHTML = '<option value="">请选择…</option>' + data.planes.map((p) =>
++      `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name || p.id)}</option>`).join('')
++    if (cur && planeById(cur)) sel.value = cur
++    renderLog()
++  }
++
++  function renderLog(): void {
++    const id = el<HTMLSelectElement>('dpLogPick').value
++    const p = id ? planeById(id) : undefined
++    const table = el('dpLogTable')
++    const empty = el('dpLogEmpty')
++    if (!p || !p.log || p.log.length === 0) {
++      table.hidden = true
++      empty.hidden = false
++      empty.textContent = p ? '这个数据面还没有推送记录。' : '选择一个数据面查看它自己的推送记录。'
++      return
++    }
++    table.hidden = false
++    empty.hidden = true
++    el('dpLogBody').innerHTML = p.log.slice().reverse().map((r) =>
++      '<tr><td>' + escapeHtml(fmtTime(r.at)) + '</td>' +
++      '<td>' + escapeHtml(REASON[r.reason] || r.reason) + '</td>' +
++      '<td>' + escapeHtml(MODE[r.mode] || r.mode) + '</td>' +
++      '<td>' + statusBadge(r.status) + '</td>' +
++      '<td>' + r.checked + ' / ' + r.valid + '</td>' +
++      '<td>' + r.added + '</td><td>' + r.pool + '</td><td>' + r.attempts + '</td>' +
++      '<td>' + escapeHtml(r.message || '') + '</td></tr>').join('')
++  }
++
++  function renderFixed(): void {
++    if (!data) return
++    const list = data.fixedDomains || []
++    const table = el('dpFixedTable')
++    const empty = el('dpFixedEmpty')
++    const tested = list.some((r) => r.at)
++    table.hidden = !tested
++    empty.hidden = tested
++    el('dpFixedBody').innerHTML = list.map((r) =>
++      '<tr><td>' + escapeHtml(r.domain) + '</td>' +
++      '<td>' + (r.at ? (r.ok ? '<span class="badge ok">可用</span>' : '<span class="badge info">未通过</span>') : '—') + '</td>' +
++      '<td>' + (r.latencyMs ? r.latencyMs + ' ms' : '—') + '</td>' +
++      '<td>' + (r.speedMBps ? r.speedMBps.toFixed(2) + ' MB/s' : '—') + '</td>' +
++      '<td>' + escapeHtml(r.colo || '—') + '</td>' +
++      '<td>' + escapeHtml(r.note || '') + '</td>' +
++      '<td>' + escapeHtml(fmtTime(r.at)) + '</td></tr>').join('')
++  }
++
++  /* ---------------- 表单 ---------------- */
++
++  function fillProfileOptions(selected: string): void {
++    const sel = el<HTMLSelectElement>('dpFormProfile')
++    const list = data?.profiles || []
++    sel.innerHTML = '<option value="">请选择账号…</option>' + list.map((p) => {
++      const warn = !p.hasToken ? '（缺 Token）' : !p.hasKv ? '（未选 KV）' : ''
++      return `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name + (p.accountName ? '（' + p.accountName + '）' : '') + warn)}</option>`
++    }).join('')
++    sel.value = selected
++  }
++
++  function openForm(p?: DpPlaneView): void {
++    el('dpFormCard').hidden = false
++    el('dpFormTitle').textContent = p ? '编辑数据面：' + (p.name || p.id) : '新增数据面'
++    el<HTMLInputElement>('dpFormId').value = p ? p.id : ''
++    el<HTMLInputElement>('dpFormName').value = p ? p.name : ''
++    fillProfileOptions(p ? p.profileId : '')
++    el<HTMLInputElement>('dpFormDomain').value = p ? p.domain : ''
++    el<HTMLInputElement>('dpFormUUID').value = p ? p.uuid : ''
++    el<HTMLInputElement>('dpFormWs').value = p ? p.wsPath : ''
++    el<HTMLInputElement>('dpFormTrojanPath').value = p ? p.trojanPath : ''
++    el<HTMLInputElement>('dpFormXhttp').value = p ? p.xhttpPath : ''
++    el<HTMLInputElement>('dpFormTrojanPw').value = p ? p.trojanPassword : ''
++    el<HTMLInputElement>('dpFormFromDeploy').checked = !p
++    el<HTMLInputElement>('dpFormEnabled').checked = p ? p.enabled : true
++    el<HTMLInputElement>('dpFormAutoPush').checked = p ? p.autoPush : true
++    el('dpFormCard').scrollIntoView({ behavior: 'smooth', block: 'nearest' })
++  }
++
++  function closeForm(): void {
++    el('dpFormCard').hidden = true
++  }
++
++  async function saveForm(): Promise<void> {
++    const v = (id: string): string => el<HTMLInputElement>(id).value.trim()
++    const profileId = el<HTMLSelectElement>('dpFormProfile').value
++    if (!profileId) {
++      log('请先选择该数据面所属的账号（账号需先在「凭据」页添加）', 'warn')
++      return
++    }
++    const req: DpSaveRequest = {
++      id: v('dpFormId'),
++      name: v('dpFormName'),
++      profileId,
++      domain: v('dpFormDomain'),
++      uuid: v('dpFormUUID'),
++      wsPath: v('dpFormWs'),
++      trojanPath: v('dpFormTrojanPath'),
++      xhttpPath: v('dpFormXhttp'),
++      trojanPassword: v('dpFormTrojanPw'),
++      enabled: el<HTMLInputElement>('dpFormEnabled').checked,
++      autoPush: el<HTMLInputElement>('dpFormAutoPush').checked,
++      fromDeploy: el<HTMLInputElement>('dpFormFromDeploy').checked,
++    }
++    const btn = el<HTMLButtonElement>('btnDpFormSave')
++    btn.disabled = true
++    try {
++      const r = await window.cfpilot.dpSave(req)
++      if (!r || !r.ok) {
++        log('保存数据面失败：' + ((r && r.error) || '未知错误'), 'err')
++        return
++      }
++      log('已保存数据面：' + ((r.plane && (r.plane.name || r.plane.id)) || ''), 'ok')
++      if (r.warning) log(r.warning, 'warn')
++      if (r.pushStarted) {
++        log('已开始把当前优选结果推送到新数据面（结果见「推送记录」）', 'info')
++        startPolling()
++      }
++      closeForm()
++      await load(true)
++    } finally {
++      btn.disabled = false
++    }
++  }
++
++  /* ---------------- 推送 / 同步 / 删除 ---------------- */
++
++  function startPolling(): void {
++    if (pollTimer !== null) window.clearInterval(pollTimer)
++    let n = 0
++    pollTimer = window.setInterval(() => {
++      n++
++      void load(true).then(() => {
++        if ((data && !data.pushing) || n >= 40) {
++          if (pollTimer !== null) window.clearInterval(pollTimer)
++          pollTimer = null
++        }
++      })
++    }, 3000)
++  }
++
++  async function push(ids: string[], mode: string): Promise<void> {
++    if (mode === 'replace') {
++      const names = ids.length ? ids.map((i) => (planeById(i)?.name || i)).join('、') : '全部启用的数据面'
++      if (!window.confirm('「替换」会用本次优选结果覆盖这些数据面的池：\n' + names + '\n\n确定继续吗？')) return
++    }
++    const r = await window.cfpilot.dpPush(ids, mode)
++    if (!r || !r.ok) {
++      log('推送未开始：' + ((r && r.error) || '未知错误'), 'warn')
++      return
++    }
++    log('已开始推送（' + (MODE[r.mode || ''] || r.mode) + '，' + r.count + ' 条）；各数据面的结果见「推送记录」', 'info')
++    startPolling()
++  }
++
++  async function deploy(ids: string[]): Promise<void> {
++    const names = ids.length ? ids.map((i) => (planeById(i)?.name || i)).join('、') : '全部启用的数据面'
++    const plane = el<HTMLSelectElement>('dpDeployPlane').value
++    const force = el<HTMLInputElement>('dpDeployForce').checked
++    if (!window.confirm('部署 / 升级：' + names + '\n\n只更新数据面，用各自账号的凭据，逐个串行执行（每个之间间隔几秒）；失败不会重试。\n确定开始吗？')) return
++    const r = await window.cfpilot.dpDeploy(ids, { force, dataPlaneMode: plane })
++    if (!r || !r.ok) {
++      log('部署未开始：' + ((r && r.error) || '未知错误'), 'warn')
++      return
++    }
++    log('已开始部署 ' + r.count + ' 个数据面，进度见运行日志', 'info')
++    if (r.skippedPrecheck && r.skippedPrecheck.length) {
++      log('这些数据面缺条件，已跳过：\n' + r.skippedPrecheck.join('\n'), 'warn')
++    }
++  }
++
++  async function removeIps(): Promise<void> {
++    const id = el<HTMLSelectElement>('dpLogPick').value
++    if (!id) {
++      log('请先在上面选择一个数据面', 'warn')
++      return
++    }
++    const ips = el<HTMLTextAreaElement>('dpRemoveIps').value
++      .split(/\r?\n/).map((x) => x.trim()).filter(Boolean)
++    if (ips.length === 0) {
++      log('请输入要删除的 IP（每行一个）', 'warn')
++      return
++    }
++    const name = planeById(id)?.name || id
++    if (!window.confirm('从「' + name + '」的池里删除 ' + ips.length + ' 条 IP？\n只影响这个数据面。')) return
++    const r = await window.cfpilot.dpRemoveIps(id, ips)
++    if (!r || !r.ok) {
++      log('删除失败：' + ((r && r.error) || '未知错误'), 'err')
++    } else {
++      log('已从「' + name + '」删除 ' + ips.length + ' 条 IP', 'ok')
++      el<HTMLTextAreaElement>('dpRemoveIps').value = ''
++    }
++    await load(true)
++  }
++
++  async function onTableClick(ev: Event): Promise<void> {
++    const btn = (ev.target as HTMLElement).closest('button[data-act]') as HTMLElement | null
++    if (!btn) return
++    const tr = btn.closest('tr') as HTMLElement | null
++    const id = tr?.dataset.id || ''
++    const p = planeById(id)
++    if (!p) return
++    const act = btn.dataset.act
++    if (act === 'push') {
++      await push([id], 'append')
++    } else if (act === 'replace') {
++      await push([id], 'replace')
++    } else if (act === 'deploy') {
++      await deploy([id])
++    } else if (act === 'edit') {
++      openForm(p)
++    } else if (act === 'sync') {
++      const r = await window.cfpilot.dpSyncDeploy(id)
++      if (!r || !r.ok) {
++        log('读取部署失败：' + ((r && r.error) || '未知错误'), 'err')
++      } else {
++        log('已从该账号的部署更新「' + (p.name || id) + '」的域名 / UUID / 路径', 'ok')
++        if (r.warning) log(r.warning, 'warn')
++      }
++      await load(true)
++    } else if (act === 'del') {
++      if (!window.confirm('删除数据面「' + (p.name || id) + '」？\n它在控制面上的订阅条目和独立优选池会一并清掉；Cloudflare 上的 Worker 不会被删除。')) return
++      const r = await window.cfpilot.dpDelete(id)
++      if (!r || !r.ok) {
++        log('删除失败：' + ((r && r.error) || '未知错误'), 'err')
++      } else {
++        log('已删除数据面「' + (p.name || id) + '」', 'ok')
++        if (r.warning) log(r.warning, 'warn')
++      }
++      await load(true)
++    }
++  }
++
++  async function saveSettings(): Promise<void> {
++    if (!data) return
++    const top = parseInt(el<HTMLInputElement>('dpTop').value, 10)
++    const next: DpSettingsView = {
++      controlProfileId: el<HTMLSelectElement>('dpCtlProfile').value,
++      pushAfterAdd: el<HTMLInputElement>('dpPushAfterAdd').checked,
++      pushAfterScan: el<HTMLInputElement>('dpPushAfterScan').checked,
++      mode: el<HTMLSelectElement>('dpMode').value === 'replace' ? 'replace' : 'append',
++      top: Number.isFinite(top) && top > 0 ? Math.min(top, 200) : 15,
++    }
++    if (next.mode === 'replace' && next.pushAfterScan &&
++      !window.confirm('自动推送设为「替换」后，每次优选完成都会覆盖各数据面的池。\n建议保持「追加」。仍要保存吗？')) return
++    const r = await window.cfpilot.dpSettings(next)
++    const hint = el('dpSettingsHint')
++    if (!r || !r.ok) {
++      hint.textContent = '保存失败：' + ((r && r.error) || '未知错误')
++      log('保存数据面设置失败：' + ((r && r.error) || '未知错误'), 'err')
++      return
++    }
++    hint.textContent = '已保存'
++    log('已保存多数据面推送设置', 'ok')
++    await load(false)
++  }
++
++  /* ---------------- 事件绑定 ---------------- */
++
++  const on = (id: string, fn: () => void | Promise<void>): void => {
++    el(id)?.addEventListener('click', () => { void fn() })
++  }
++  on('btnDpAdd', () => openForm())
++  on('btnDpFormCancel', closeForm)
++  on('btnDpFormSave', saveForm)
++  on('btnDpRefresh', () => load(true))
++  on('btnDpPushAll', () => push([], ''))
++  on('btnDpDeployAll', () => deploy([]))
++  on('btnDpSettingsSave', saveSettings)
++  on('btnDpRemoveIps', removeIps)
++  el('dpBody')?.addEventListener('click', (e) => { void onTableClick(e) })
++  el('dpLogPick')?.addEventListener('change', renderLog)
++  // 定时 / 优选完成后的自动推送结束时，后端会发 dp-push 事件：已打开过本页就静默刷新
++  try {
++    window.cfpilot.onDpPush(() => { if (loaded) void load(true) })
++    window.cfpilot.onDpDeploy((p) => {
++      for (const x of p.results || []) {
++        log('数据面「' + x.name + '」：' + (x.ok ? (x.skipped ? '已是最新' : '部署完成') : '失败') +
++          (x.message ? ' —— ' + x.message : ''), x.ok ? 'ok' : 'err')
++      }
++      if (loaded) void load(true)
++    })
++  } catch {
++    /* 适配层较旧时没有这个事件，页面仍可手动刷新 */
++  }
++
++  /** 切到本页：首次加载带池条数；之后切回来不重拉，避免冲掉正在编辑的内容。 */
++  return () => {
++    if (!loaded) void load(true)
++  }
++}
+diff --git a/packages/ui/src/globals.d.ts b/packages/ui/src/globals.d.ts
+index 4d2f1ec..71c915f 100644
+--- a/packages/ui/src/globals.d.ts
++++ b/packages/ui/src/globals.d.ts
+@@ -413,6 +413,16 @@ interface Window {
+      */
+     quickScan(): Promise<QuickScanResult>
+ 
++    /* ---------------- 1:N 多数据面（数据面管理页） ---------------- */
++    dpList(withPools?: boolean): Promise<DpListResult>
++    dpSave(plane: DpSaveRequest): Promise<{ ok: boolean; plane?: DpPlaneView; warning?: string; pushStarted?: boolean; error?: string }>
++    dpDelete(id: string): Promise<{ ok: boolean; warning?: string; error?: string }>
++    dpSyncDeploy(id: string): Promise<{ ok: boolean; plane?: DpPlaneView; warning?: string; error?: string }>
++    dpPush(ids?: string[], mode?: string, lines?: string[]): Promise<{ ok: boolean; started?: boolean; mode?: string; count?: number; error?: string }>
++    dpRemoveIps(id: string, ips: string[]): Promise<{ ok: boolean; result?: DpPushRecordView; error?: string }>
++    dpSettings(settings: DpSettingsView): Promise<{ ok: boolean; settings?: DpSettingsView; error?: string }>
++    dpDeploy(ids?: string[], opts?: { force?: boolean; dataPlaneMode?: string }): Promise<{ ok: boolean; started?: boolean; count?: number; skippedPrecheck?: string[]; note?: string; error?: string }>
++
+     /* ---------------- 外部 IP 数据源（Phase 5） ---------------- */
+     /** 数据源配置 + 池统计 + 定时器状态，一次取齐 */
+     sourcesList(): Promise<SourcesListResult>
+@@ -754,6 +764,10 @@ interface Window {
+     onScanResult(cb: (payload: CFPilotScanResult) => void): () => void
+     /** 定时优选任务的状态变化（运行中 / 完成 / 失败 / 被跳过） */
+     onTaskStatus(cb: (payload: ScheduledTaskStatus) => void): () => void
++    /** 一轮多数据面推送结束（数据面页据此自动刷新记录） */
++    onDpPush(cb: (payload: { at: number }) => void): () => void
++    /** 数据面部署 / 升级结束（带每个数据面的结果） */
++    onDpDeploy(cb: (payload: { at: number; results: DpDeployResultView[] }) => void): () => void
+     /* ---------------- 反代优选（出站链路体检） ---------------- */
+     /**
+      * 启动反代体检（异步：结果走 `onRelayResult`）。
+@@ -1350,3 +1364,88 @@ interface SourcesListResult {
+ }
+ 
+ type ExternalSourceType = 'github-raw' | 'custom-url' | 'ripe-stat'
++
++/* ---------------- 1:N 多数据面 ---------------- */
++interface DpPushRecordView {
++  at: number
++  reason: string
++  mode: string
++  status: string
++  message: string
++  checked: number
++  valid: number
++  added: number
++  pool: number
++  attempts: number
++}
++interface DpPlaneView {
++  id: string
++  name: string
++  profileId: string
++  workerName: string
++  domain: string
++  uuid: string
++  wsPath: string
++  trojanPassword: string
++  trojanPath: string
++  xhttpPath: string
++  enabled: boolean
++  autoPush: boolean
++  kernelVersion: string
++  lastDeployAt: string
++  createdAt: number
++  updatedAt: number
++  log: DpPushRecordView[]
++}
++interface DpDeployResultView {
++  id: string
++  name: string
++  ok: boolean
++  skipped: boolean
++  message: string
++  warnings?: string[]
++  kernelVersion?: string
++}
++interface DpSettingsView {
++  controlProfileId: string
++  pushAfterAdd: boolean
++  pushAfterScan: boolean
++  mode: string
++  top: number
++}
++interface DpFixedRecordView {
++  domain: string
++  ips: string[]
++  ok: boolean
++  latencyMs: number
++  speedMBps: number
++  colo: string
++  note: string
++  at: number
++}
++interface DpSaveRequest {
++  id?: string
++  name?: string
++  profileId?: string
++  workerName?: string
++  domain?: string
++  uuid?: string
++  wsPath?: string
++  trojanPassword?: string
++  trojanPath?: string
++  xhttpPath?: string
++  enabled?: boolean
++  autoPush?: boolean
++  fromDeploy?: boolean
++}
++interface DpListResult {
++  ok: boolean
++  planes: DpPlaneView[]
++  settings: DpSettingsView
++  profiles: Array<{ id: string; name: string; accountName: string; hasToken: boolean; hasKv: boolean }>
++  pools: Record<string, number>
++  poolError: string
++  pushing: boolean
++  fixedDomains: DpFixedRecordView[]
++  error?: string
++}
+diff --git a/packages/ui/src/index.html b/packages/ui/src/index.html
+index d5d75e2..797b9d0 100644
+--- a/packages/ui/src/index.html
++++ b/packages/ui/src/index.html
+@@ -1280,6 +1280,7 @@
+       <button type="button" data-page="deploy">🚀 部署</button>
+       <button type="button" data-page="scan">⚡ 优选</button>
+       <button type="button" data-page="sources">🌐 数据源</button>
++      <button type="button" data-page="dp">🛰️ 数据面</button>
+       <button type="button" data-page="about">📘 说明</button>
+       <button type="button" data-page="logs">📄 日志</button>
+     </nav>
+@@ -2211,6 +2212,118 @@
+         </section>
+ 
+         <!-- ============ 说明 ============ -->
++        <!-- ============ 数据面管理（1:N 多数据面） ============ -->
++        <section class="page" id="page-dp">
++          <div class="card">
++            <h2><span class="dot"></span>🛰️ 多数据面推送设置 <span class="badge info" id="dpBadge">0 个数据面</span></h2>
++            <p class="desc">
++              一个控制面，N 个数据面（各用各的 Cloudflare 账号）。优选结果由本机按数据面<b>分别</b>验证、分别推送，
++              互不影响：某个数据面失败只记在它自己名下。订阅由控制面聚合，客户端自行选择节点。
++            </p>
++            <div class="row">
++              <div class="field" style="flex:2"><label for="dpCtlProfile">控制面所在账号</label>
++                <select id="dpCtlProfile"><option value="">当前活跃账号</option></select>
++              </div>
++              <div class="field"><label for="dpMode">自动推送写入方式</label>
++                <select id="dpMode"><option value="append">追加（默认，去重）</option><option value="replace">替换（覆盖该数据面的池）</option></select>
++              </div>
++              <div class="field"><label for="dpTop">每个数据面推送条数</label>
++                <input type="number" id="dpTop" min="1" max="200" value="15" />
++              </div>
++            </div>
++            <div class="btn-row" style="margin-top:8px;align-items:center">
++              <label style="display:inline-flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpPushAfterAdd" checked /> 新增数据面后立即推送</label>
++              <label style="display:inline-flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpPushAfterScan" checked /> 每次优选完成后自动推送</label>
++            </div>
++            <div class="btn-row" style="margin-top:10px">
++              <button class="btn btn-primary btn-sm" id="btnDpSettingsSave" type="button">保存设置</button>
++              <span class="tip" id="dpSettingsHint" style="margin:0"></span>
++            </div>
++          </div>
++
++          <div class="card">
++            <h2><span class="dot"></span>📋 数据面清单</h2>
++            <div class="btn-row" style="margin-bottom:8px">
++              <button class="btn btn-primary btn-sm" id="btnDpAdd" type="button">新增数据面</button>
++              <button class="btn btn-ghost btn-sm" id="btnDpRefresh" type="button">刷新（含池条数）</button>
++              <button class="btn btn-ghost btn-sm" id="btnDpPushAll" type="button">推送到全部启用的数据面</button>
++              <button class="btn btn-ghost btn-sm" id="btnDpDeployAll" type="button">部署 / 升级全部</button>
++              <select id="dpDeployPlane" title="数据面部署形态">
++                <option value="">形态：沿用已部署的</option>
++                <option value="pages">形态：Pages</option>
++                <option value="workers">形态：Workers</option>
++              </select>
++              <label style="display:inline-flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpDeployForce" /> 强制重新部署</label>
++              <span class="tip" id="dpPushState" style="margin:0"></span>
++            </div>
++            <table id="dpTable" hidden>
++              <thead><tr><th>名称</th><th>账号</th><th>域名</th><th>状态</th><th>池条数</th><th>最近推送</th><th>内核</th><th>操作</th></tr></thead>
++              <tbody id="dpBody"></tbody>
++            </table>
++            <p class="tip" style="margin-top:8px">「部署 / 升级」只动数据面：用该数据面所属账号的凭据，不碰控制面，逐个串行、失败不重试、互不影响。账号里已有的 UUID / 路径会沿用，订阅里的老节点不变。</p>
++            <p class="tip" id="dpEmpty">还没有数据面。点「新增数据面」，选择它所属的账号，再从该账号的部署读取域名 / UUID / 路径。</p>
++          </div>
++
++          <div class="card" id="dpFormCard" hidden>
++            <h2><span class="dot"></span><span id="dpFormTitle">新增数据面</span></h2>
++            <input type="hidden" id="dpFormId" />
++            <div class="row">
++              <div class="field"><label for="dpFormName">名称</label><input type="text" id="dpFormName" placeholder="如 账号B-主力" /></div>
++              <div class="field" style="flex:2"><label for="dpFormProfile">所属账号（在「凭据」页先添加）</label>
++                <select id="dpFormProfile"></select>
++              </div>
++            </div>
++            <div class="row" style="margin-top:6px">
++              <div class="field" style="flex:2"><label for="dpFormDomain">数据面域名（SNI / Host）</label><input type="text" id="dpFormDomain" placeholder="留空则从部署读取" /></div>
++              <div class="field" style="flex:2"><label for="dpFormUUID">UUID</label><input type="text" id="dpFormUUID" placeholder="留空则从部署读取" /></div>
++            </div>
++            <div class="row" style="margin-top:6px">
++              <div class="field"><label for="dpFormWs">WS 路径</label><input type="text" id="dpFormWs" placeholder="/xxxx" /></div>
++              <div class="field"><label for="dpFormTrojanPath">Trojan 路径</label><input type="text" id="dpFormTrojanPath" placeholder="可空" /></div>
++              <div class="field"><label for="dpFormXhttp">XHTTP 路径</label><input type="text" id="dpFormXhttp" placeholder="可空" /></div>
++              <div class="field"><label for="dpFormTrojanPw">Trojan 密码</label><input type="text" id="dpFormTrojanPw" placeholder="可空" /></div>
++            </div>
++            <div class="btn-row" style="margin-top:8px;align-items:center">
++              <label style="display:inline-flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpFormFromDeploy" checked /> 保存时从该账号的部署读取缺省字段</label>
++              <label style="display:inline-flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpFormEnabled" checked /> 启用</label>
++              <label style="display:inline-flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpFormAutoPush" checked /> 参与自动推送</label>
++            </div>
++            <div class="btn-row" style="margin-top:10px">
++              <button class="btn btn-primary btn-sm" id="btnDpFormSave" type="button">保存数据面</button>
++              <button class="btn btn-ghost btn-sm" id="btnDpFormCancel" type="button">取消</button>
++            </div>
++            <p class="tip" style="margin-top:6px">只有域名 / UUID / 路径会同步到控制面用于订阅；Account ID、API Token、KV 只留在本机。</p>
++          </div>
++
++          <div class="card">
++            <h2><span class="dot"></span>🧾 推送记录与 IP 管理</h2>
++            <div class="row">
++              <div class="field"><label for="dpLogPick">选择数据面</label><select id="dpLogPick"></select></div>
++            </div>
++            <table id="dpLogTable" hidden style="margin-top:8px">
++              <thead><tr><th>时间</th><th>来源</th><th>方式</th><th>结果</th><th>验证 / 通过</th><th>新增</th><th>池</th><th>尝试</th><th>说明</th></tr></thead>
++              <tbody id="dpLogBody"></tbody>
++            </table>
++            <p class="tip" id="dpLogEmpty">选择一个数据面查看它自己的推送记录。</p>
++            <div class="field" style="margin-top:10px">
++              <label for="dpRemoveIps">从所选数据面的池里删除 IP（每行一个，只影响这个数据面）</label>
++              <textarea id="dpRemoveIps" rows="3" placeholder="104.16.1.1:443&#10;1.2.3.4"></textarea>
++            </div>
++            <div class="btn-row" style="margin-top:8px">
++              <button class="btn btn-ghost btn-sm" id="btnDpRemoveIps" type="button">删除这些 IP</button>
++            </div>
++          </div>
++
++          <div class="card">
++            <h2><span class="dot"></span>📌 固定优选域名（测速只作记录，永远在订阅优选池里）</h2>
++            <table id="dpFixedTable" hidden>
++              <thead><tr><th>域名</th><th>结果</th><th>延迟</th><th>速度</th><th>地区</th><th>说明</th><th>时间</th></tr></thead>
++              <tbody id="dpFixedBody"></tbody>
++            </table>
++            <p class="tip" id="dpFixedEmpty">还没有测速记录；下次优选完成后会出现。</p>
++          </div>
++        </section>
++
+         <section class="page" id="page-about">
+           <div class="card">
+             <h2><span class="dot"></span>⬆️ 检查更新 <span class="badge info" id="updateBadge">未检查</span></h2>
 diff --git a/packages/ui/src/renderer.ts b/packages/ui/src/renderer.ts
-index 9354f73..406f193 100644
+index 0b9f474..db7081d 100644
 --- a/packages/ui/src/renderer.ts
 +++ b/packages/ui/src/renderer.ts
-@@ -809,7 +809,7 @@ import {
+@@ -11,6 +11,7 @@ import {
+   taskRowHtml,
+   taskStatusText,
+ } from './task-rows'
++import { bindDpPage } from './dp-page'
+ 
+ (function () {
+   'use strict'
+@@ -55,6 +56,9 @@ import {
+   /** 切到「数据源」页时首次自动加载（切回来不重拉，避免冲掉用户勾选）。 */
+   let autoLoadSources: (() => void) | null = null
+ 
++  /** 切到「数据面」页时首次自动加载（1:N 多数据面，见 dp-page.ts）。 */
++  let autoLoadDp: (() => void) | null = null
++
+   function switchPage(name: string): void {
+     document.querySelectorAll('#nav button').forEach((b) => {
+       b.classList.toggle('active', (b as HTMLElement).dataset.page === name)
+@@ -76,6 +80,10 @@ import {
+     if (name === 'sources' && autoLoadSources) {
+       autoLoadSources()
+     }
++    // 数据面页：第一次切进来时拉一次清单与各数据面池条数
++    if (name === 'dp' && autoLoadDp) {
++      autoLoadDp()
++    }
+     // 部署页：切进来后重算横向滚动。
+     //
+     // 为什么必须重算：页面**隐藏时**容器宽度是 0，测不出超出量，
+@@ -809,7 +817,7 @@ import {
            .detectAccount()
            .then((acc) => {
              const url = acc && acc.accountId
@@ -2449,8 +3877,25 @@ index 9354f73..406f193 100644
                : 'https://dash.cloudflare.com/'
              return window.cfpilot.openExternal(url)
            })
+@@ -6632,6 +6640,7 @@ import {
+ 
+   document.addEventListener('DOMContentLoaded', async () => {
+     bindSourcesPage()
++    autoLoadDp = bindDpPage({ log })
+     document.getElementById('nav')!.addEventListener('click', (e) => {
+       const btn = (e.target as HTMLElement).closest('button[data-page]') as HTMLElement | null
+       if (btn) switchPage(btn.dataset.page!)
+@@ -6864,7 +6873,7 @@ import {
+      */
+     const pageParam = new URLSearchParams(location.search).get('page')
+     if (pageParam) {
+-      const valid = ['cred', 'deploy', 'scan', 'sources', 'about', 'logs']
++      const valid = ['cred', 'deploy', 'scan', 'sources', 'dp', 'about', 'logs']
+       if (valid.includes(pageParam)) {
+         switchPage(pageParam)
+         log('已跳转到「' + pageParam + '」页')
 diff --git a/packages/worker-core/src/api.ts b/packages/worker-core/src/api.ts
-index 0dfd7fa..63dd4fe 100644
+index e7793af..2afb0ef 100644
 --- a/packages/worker-core/src/api.ts
 +++ b/packages/worker-core/src/api.ts
 @@ -20,6 +20,10 @@ import {
@@ -2464,7 +3909,7 @@ index 0dfd7fa..63dd4fe 100644
    loadDomainLibrary,
    loadLocalIps,
    loadRouteProfile,
-@@ -266,9 +270,9 @@ export async function handleApi(
+@@ -269,9 +273,9 @@ export async function handleApi(
      const token = header.startsWith('Bearer ') ? header.slice(7).trim() : header.trim()
      const authorized = await verifyScanToken(store, token, env)
      if (!authorized) return error('Token 校验失败', 401)
@@ -2476,7 +3921,7 @@ index 0dfd7fa..63dd4fe 100644
      } catch {
        return error('请求体解析失败', 400)
      }
-@@ -359,6 +363,64 @@ export async function handleApi(
+@@ -362,6 +366,64 @@ export async function handleApi(
        })
      }
  
@@ -2541,7 +3986,7 @@ index 0dfd7fa..63dd4fe 100644
      // ---- 写「本地优选池」（独立键，订阅的 L1 来源）----
      //
      // ⚠️ KV 免费版配额是 **1000 次写/天**，而「一键优选」可能一天跑好几次
-@@ -426,6 +488,35 @@ export async function handleApi(
+@@ -429,6 +491,35 @@ export async function handleApi(
      })
    }
  
@@ -2578,7 +4023,7 @@ index 0dfd7fa..63dd4fe 100644
    const authenticated = await verifySession(store, request)
    if (!authenticated) return error('未登录或会话已过期', 401)
 diff --git a/packages/worker-core/src/config.ts b/packages/worker-core/src/config.ts
-index 577dac6..f856f8f 100644
+index 8654c13..d6c9dc1 100644
 --- a/packages/worker-core/src/config.ts
 +++ b/packages/worker-core/src/config.ts
 @@ -1,7 +1,7 @@
@@ -2606,7 +4051,7 @@ index 577dac6..f856f8f 100644
  /** KV 中热更新的优选域名库（每行一个域名；为空则用内置库） */
  export const POOL_DOMAIN_KEY = 'POOL_DOMAIN_LIBRARY'
  /**
-@@ -538,3 +547,75 @@ export async function saveDomainLibrary(store: Store, domains: string[]): Promis
+@@ -551,3 +560,75 @@ export async function saveDomainLibrary(store: Store, domains: string[]): Promis
    }
    await store.put(POOL_DOMAIN_KEY, cleaned.join('\n'))
  }
