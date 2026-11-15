@@ -56,9 +56,11 @@ jobs:
           OLD=$(gh release view kwrt-latest --json body -q .body 2>/dev/null | grep -o 'build-key: [0-9a-f-]*' | head -n1 | cut -d' ' -f2 || true)
           PREV=$(echo "$OLD" | cut -d- -f1)
           echo "上游：$SHA；构建标识：$KEY；上次：${OLD:-无}"
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "key=$KEY" >> "$GITHUB_OUTPUT"
-          echo "prev=$PREV" >> "$GITHUB_OUTPUT"
+          {
+            echo "sha=$SHA"
+            echo "key=$KEY"
+            echo "prev=$PREV"
+          } >> "$GITHUB_OUTPUT"
           if [ "$KEY" = "$OLD" ] && [ "${{ inputs.force }}" != "true" ]; then
             echo "build=no" >> "$GITHUB_OUTPUT"; echo "无变化，跳过"
           else
@@ -117,16 +119,16 @@ jobs:
             cat out/SHA256SUMS
             echo '```'
           } > notes.md
-          FILES="out/cfpilot-kwrt-armv7 out/cfpilot-kwrt-armv7.sha256 out/install-cfpilot-kwrt.sh out/SHA256SUMS"
+          FILES=(out/cfpilot-kwrt-armv7 out/cfpilot-kwrt-armv7.sha256 out/install-cfpilot-kwrt.sh out/SHA256SUMS)
           # 留档版本（可回退）
           gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$TAG" $FILES --title "Kwrt ARMv7 $VER" --notes-file notes.md --target "${{ github.sha }}"
+          gh release create "$TAG" "${FILES[@]}" --title "Kwrt ARMv7 $VER" --notes-file notes.md --target "${{ github.sha }}"
           # 固定地址（路由器升级用）
           if gh release view kwrt-latest >/dev/null 2>&1; then
-            gh release upload kwrt-latest $FILES --clobber
+            gh release upload kwrt-latest "${FILES[@]}" --clobber
             gh release edit kwrt-latest --title "Kwrt ARMv7 最新版（$VER）" --notes-file notes.md
           else
-            gh release create kwrt-latest $FILES --title "Kwrt ARMv7 最新版（$VER）" --notes-file notes.md --target "${{ github.sha }}"
+            gh release create kwrt-latest "${FILES[@]}" --title "Kwrt ARMv7 最新版（$VER）" --notes-file notes.md --target "${{ github.sha }}"
           fi
 
       - name: 失败时开 Issue 提醒（旧版本保持可用）
