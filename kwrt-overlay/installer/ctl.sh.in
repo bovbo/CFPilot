@@ -44,7 +44,7 @@ get_port() {
 }
 
 is_elf() {
-    [ "$(head -c4 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]
+    [ "$(head -c4 "$1" 2>/dev/null | tr '\177' 'X')" = "XELF" ]
 }
 
 # 新程序能不能在这台路由器上跑：先试 --version
