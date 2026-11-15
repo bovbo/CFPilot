@@ -1,0 +1,460 @@
+#!/bin/sh
+# CFPilot 路由器版 一键安装 / 升级 / 管理脚本（Kwrt / OpenWrt，ARMv7）  v2
+#
+# 首次安装（SSH 里执行）：
+#   1. 把 cfpilot-kwrt-armv7 和本脚本传到路由器 /tmp
+#   2. sh /tmp/install-cfpilot-kwrt.sh
+# 装好后，本脚本会复制成命令 cfpilot-ctl，以后直接用：
+#   cfpilot-ctl status            运行状态 + 内存 + 连接表
+#   cfpilot-ctl url               查看管理地址
+#   cfpilot-ctl mem               资源监控采样（最近 20 行）
+#   cfpilot-ctl logs [行数]       程序日志
+#   cfpilot-ctl upgrade [文件|网址]  升级（自动备份、自检、失败自动回滚）
+#   cfpilot-ctl rollback          回到上一个版本
+#   cfpilot-ctl backup            备份数据（Token / 配置）
+#   cfpilot-ctl autoupdate on|off 每周自动升级（需先配置升级网址）
+#   cfpilot-ctl luci              重新安装 LuCI 菜单
+#   cfpilot-ctl uninstall         卸载（数据目录保留）
+#
+# 数据（Token、配置）在 /etc/cfpilot；升级只换程序，数据不动。
+
+BIN_DST="/usr/bin/cfpilot"
+CTL_DST="/usr/bin/cfpilot-ctl"
+WD_DST="/usr/bin/cfpilot-watchdog"
+DATA_DIR="/etc/cfpilot"
+PREV_BIN="$DATA_DIR/cfpilot.prev"
+BACKUP_DIR="$DATA_DIR/backup"
+UP_CONF="$DATA_DIR/upgrade.conf"
+WD_CONF="$DATA_DIR/watchdog.conf"
+INIT="/etc/init.d/cfpilot"
+URL_FILE="/tmp/cfpilot.url"
+MEM_LOG="/tmp/cfpilot-mem.log"
+DEFAULT_SRC="${CFPILOT_BIN:-/tmp/cfpilot-kwrt-armv7}"
+DEFAULT_PORT=19726
+HEALTH_WAIT="${CFPILOT_HEALTH_WAIT:-40}"
+
+say() { echo "$*"; }
+die() { echo "错误：$*" >&2; exit 1; }
+
+# ---------------- 工具函数 ----------------
+get_port() {
+    p=""
+    [ -s "$URL_FILE" ] && p=$(sed -n 's#^[a-z]*://[^/:]*:\([0-9][0-9]*\).*#\1#p' "$URL_FILE" | head -n1)
+    echo "${p:-$DEFAULT_PORT}"
+}
+
+is_elf() {
+    [ "$(head -c4 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]
+}
+
+# 新程序能不能在这台路由器上跑：先试 --version
+trial_ok() {
+    chmod 755 "$1" 2>/dev/null
+    out=$("$1" --version 2>&1) || return 1
+    case "$out" in *CFPilot*) return 0 ;; *) return 1 ;; esac
+}
+
+ver_of() { "$1" --version 2>/dev/null | head -n1; }
+
+port_listening() {
+    hex=$(printf '%04X' "$1")
+    grep -qiE ":$hex [0-9A-F:]+ 0A " /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
+# 健康检查：进程在、端口在监听、且稳定 6 秒不换 PID（换了 = 在崩溃重启循环）
+healthy() {
+    limit="${1:-$HEALTH_WAIT}"
+    port=$(get_port)
+    i=0
+    while [ $i -lt "$limit" ]; do
+        pid=$(pidof cfpilot 2>/dev/null | awk '{print $1}')
+        if [ -n "$pid" ]; then
+            port=$(get_port)
+            if port_listening "$port"; then
+                sleep 6
+                pid2=$(pidof cfpilot 2>/dev/null | awk '{print $1}')
+                [ "$pid" = "$pid2" ] && port_listening "$port" && return 0
+            fi
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+free_kb() { df -k "$1" 2>/dev/null | awk 'NR==2{print $4}'; }
+
+fetch() {
+    # fetch 网址 目标文件
+    url="$1"; dest="$2"
+    [ -f "$UP_CONF" ] && . "$UP_CONF"
+    case "$url" in
+        https://github.com/*|https://raw.githubusercontent.com/*) url="${GH_PROXY}${url}" ;;
+    esac
+    rm -f "$dest"
+    if command -v uclient-fetch >/dev/null 2>&1; then
+        uclient-fetch -q -T 60 -O "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        wget -q -T 60 -O "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+    fi
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --max-time 120 -o "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+    fi
+    rm -f "$dest"
+    return 1
+}
+
+# ---------------- 内置文件（由生成器填入） ----------------
+write_init() {
+    cat > "$INIT" <<'CFP_INIT_EOF'
+@@INIT@@
+CFP_INIT_EOF
+    chmod 755 "$INIT"
+}
+
+write_watchdog() {
+    cat > "$WD_DST" <<'CFP_WD_EOF'
+@@WATCHDOG@@
+CFP_WD_EOF
+    chmod 755 "$WD_DST"
+    if [ ! -f "$WD_CONF" ]; then
+        cat > "$WD_CONF" <<'CFP_WDCONF_EOF'
+# CFPilot 看门狗参数（改完执行 /etc/init.d/cfpilot restart 生效）
+RSS_MAX_MB=80
+MIN_FREE_MB=14
+CT_PCT=88
+INTERVAL=30
+SAMPLE_EVERY=10
+COOLDOWN=600
+CFP_WDCONF_EOF
+    fi
+}
+
+write_upgrade_conf() {
+    [ -f "$UP_CONF" ] && return 0
+    cat > "$UP_CONF" <<'CFP_UPCONF_EOF'
+# CFPilot 升级设置
+# UPGRADE_URL：cfpilot-ctl upgrade（不带参数）和每周自动升级从这里下载程序。
+# 例：你自己仓库 Release 里的 cfpilot-kwrt-armv7（同目录可放 cfpilot-kwrt-armv7.sha256 用于校验）
+UPGRADE_URL="@@UPGRADE_URL@@"
+# GH_PROXY：路由器直连 GitHub 不通时，填加速前缀（以 / 结尾），例如 https://你的加速地址/
+GH_PROXY=""
+CFP_UPCONF_EOF
+    chmod 600 "$UP_CONF"
+}
+
+install_luci() {
+    if [ ! -d /usr/share/luci ] && [ ! -d /www/luci-static ]; then
+        say "未检测到 LuCI，跳过菜单安装（独立 Web 管理界面不受影响）。"
+        return 0
+    fi
+    mkdir -p /www/luci-static/resources/view/cfpilot /usr/share/luci/menu.d /usr/share/rpcd/acl.d
+    cat > /www/luci-static/resources/view/cfpilot/main.js <<'LUCIJS'
+@@LUCIJS@@
+LUCIJS
+    cat > /usr/share/luci/menu.d/luci-app-cfpilot.json <<'LUCIMENU'
+@@MENU@@
+LUCIMENU
+    cat > /usr/share/rpcd/acl.d/luci-app-cfpilot.json <<'LUCIACL'
+@@ACL@@
+LUCIACL
+    rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache 2>/dev/null
+    /etc/init.d/rpcd reload >/dev/null 2>&1
+    say "已安装 LuCI 菜单：服务 → CFPilot（刷新浏览器，必要时重新登录 LuCI）"
+}
+
+remove_luci() {
+    rm -f /www/luci-static/resources/view/cfpilot/main.js /usr/share/luci/menu.d/luci-app-cfpilot.json /usr/share/rpcd/acl.d/luci-app-cfpilot.json
+    rmdir /www/luci-static/resources/view/cfpilot 2>/dev/null
+    rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache 2>/dev/null
+    /etc/init.d/rpcd reload >/dev/null 2>&1
+}
+
+# 让 sysupgrade（刷固件保留配置）也保留 CFPilot
+keep_on_sysupgrade() {
+    f=/etc/sysupgrade.conf
+    touch "$f"
+    for p in /etc/cfpilot/ /usr/bin/cfpilot /usr/bin/cfpilot-ctl /usr/bin/cfpilot-watchdog /etc/init.d/cfpilot /etc/rc.d/S99cfpilot \
+             /www/luci-static/resources/view/cfpilot/ /usr/share/luci/menu.d/luci-app-cfpilot.json /usr/share/rpcd/acl.d/luci-app-cfpilot.json; do
+        grep -qxF "$p" "$f" || echo "$p" >> "$f"
+    done
+}
+
+# ---------------- 数据备份 ----------------
+do_backup() {
+    mkdir -p "$BACKUP_DIR"
+    chmod 700 "$BACKUP_DIR"
+    [ -d "$DATA_DIR" ] || { say "没有数据目录，跳过备份"; return 0; }
+    out="$BACKUP_DIR/data-$(date +%Y%m%d-%H%M%S).tgz"
+    list=""
+    for f in "$DATA_DIR"/*; do
+        b=$(basename "$f")
+        case "$b" in backup|cfpilot.prev|*.log|*.log.*|*.tmp) continue ;; esac
+        list="$list $b"
+    done
+    [ -z "$list" ] && { say "数据目录是空的，无需备份"; return 0; }
+    # shellcheck disable=SC2086
+    tar czf "$out" -C "$DATA_DIR" $list 2>/dev/null || { say "警告：备份失败（继续）"; rm -f "$out"; return 0; }
+    chmod 600 "$out"
+    # 只留最新 3 份
+    ls -1t "$BACKUP_DIR"/data-*.tgz 2>/dev/null | tail -n +4 | while read -r old; do rm -f "$old"; done
+    say "数据已备份：$out"
+}
+
+# ---------------- 核心：替换程序（带回滚） ----------------
+# install_binary 新程序路径
+install_binary() {
+    newbin="$1"
+    cp "$newbin" "$BIN_DST.new" || { say "复制失败（空间不足？df -h 看看）"; return 1; }
+    chmod 755 "$BIN_DST.new"
+    if ! trial_ok "$BIN_DST.new"; then
+        rm -f "$BIN_DST.new"
+        say "新程序无法在这台路由器上运行（架构不对或文件损坏），已放弃（原版本未动）。"
+        return 1
+    fi
+
+    had_old=0
+    if [ -x "$BIN_DST" ]; then
+        had_old=1
+        mkdir -p "$DATA_DIR"
+        # 先把原来的「上一版本」存一份：万一这次升级失败回滚了，别让它被误覆盖成当前版本
+        [ -x "$PREV_BIN" ] && cp "$PREV_BIN" "$PREV_BIN.keep" 2>/dev/null
+        cp "$BIN_DST" "$PREV_BIN" 2>/dev/null && chmod 755 "$PREV_BIN"
+    fi
+
+    [ -x "$INIT" ] && "$INIT" stop >/dev/null 2>&1
+    mv -f "$BIN_DST.new" "$BIN_DST"
+    mkdir -p "$DATA_DIR"
+    chmod 700 "$DATA_DIR"
+    write_init
+    write_watchdog
+    write_upgrade_conf
+    "$INIT" enable >/dev/null 2>&1
+    "$INIT" start
+
+    say "正在检查新版本是否正常运行…（最多 ${HEALTH_WAIT} 秒）"
+    if healthy; then
+        rm -f "$PREV_BIN.keep"
+        return 0
+    fi
+
+    say "新版本启动后没有正常运行。"
+    logread -e cfpilot 2>/dev/null | tail -n 15
+    if [ "$had_old" = "1" ] && [ -x "$PREV_BIN" ]; then
+        say "正在自动回滚到旧版本…"
+        "$INIT" stop >/dev/null 2>&1
+        cp "$PREV_BIN" "$BIN_DST" && chmod 755 "$BIN_DST"
+        "$INIT" start
+        # 升级失败：「上一版本」恢复成升级之前的那份
+        if [ -f "$PREV_BIN.keep" ]; then mv -f "$PREV_BIN.keep" "$PREV_BIN"; else rm -f "$PREV_BIN"; fi
+        if healthy; then
+            say "已回滚到旧版本并正常运行：$(ver_of "$BIN_DST")"
+        else
+            say "回滚后仍未正常运行，请用 logread | grep cfpilot 查看原因。"
+        fi
+    fi
+    return 1
+}
+
+show_url() {
+    i=0
+    while [ $i -lt 15 ] && [ ! -s "$URL_FILE" ]; do sleep 1; i=$((i + 1)); done
+    if [ -s "$URL_FILE" ]; then
+        say ""
+        say "管理地址（含一次性令牌，用电脑浏览器打开；令牌每次启动都会变）："
+        cat "$URL_FILE"
+        say ""
+    else
+        say "还没有生成管理地址，请稍等几秒后执行：cfpilot-ctl url ，或 logread -e cfpilot 看日志"
+    fi
+}
+
+# 解析升级来源：参数 > 配置的 UPGRADE_URL > 默认 /tmp 里的文件
+resolve_src() {
+    arg="$1"
+    [ -f "$UP_CONF" ] && . "$UP_CONF"
+    tmp="/tmp/cfpilot-upgrade.bin"
+    [ -z "$arg" ] && [ -n "$UPGRADE_URL" ] && arg="$UPGRADE_URL"
+    case "$arg" in
+        http://*|https://*)
+            say "正在下载：$arg"
+            fetch "$arg" "$tmp" || die "下载失败。路由器直连 GitHub 不通的话，在 $UP_CONF 里填 GH_PROXY，或手动把文件传到 /tmp 后执行：cfpilot-ctl upgrade /tmp/cfpilot-kwrt-armv7"
+            # 同目录有 .sha256 就校验；没有就跳过
+            if fetch "$arg.sha256" "$tmp.sha256"; then
+                want=$(awk '{print $1}' "$tmp.sha256" | head -n1)
+                got=$(sha256sum "$tmp" | awk '{print $1}')
+                if [ -n "$want" ] && [ "$want" != "$got" ]; then
+                    rm -f "$tmp" "$tmp.sha256"
+                    die "SHA256 校验不一致，已放弃（文件可能被篡改或下载不完整）"
+                fi
+                say "SHA256 校验通过"
+            fi
+            rm -f "$tmp.sha256"
+            echo "$tmp"
+            return 0
+            ;;
+        "") [ -f "$DEFAULT_SRC" ] && { echo "$DEFAULT_SRC"; return 0; } ;;
+        *) [ -f "$arg" ] && { echo "$arg"; return 0; } ;;
+    esac
+    return 1
+}
+
+do_upgrade() {
+    [ -x "$BIN_DST" ] || die "还没有安装，请先执行：sh install-cfpilot-kwrt.sh"
+    src=$(resolve_src "$1") || die "找不到升级文件。用法：cfpilot-ctl upgrade /tmp/cfpilot-kwrt-armv7  或  cfpilot-ctl upgrade https://…"
+    [ -s "$src" ] || die "升级文件为空"
+    is_elf "$src" || die "$src 不是可执行程序（ELF），可能下载到了网页或文件损坏"
+
+    need=$(( $(wc -c < "$src") / 1024 * 2 + 1024 ))
+    have=$(free_kb /usr/bin)
+    if [ -n "$have" ] && [ "$have" -lt "$need" ] 2>/dev/null; then
+        die "空间不足：需要约 ${need}KB，/usr/bin 只剩 ${have}KB（df -h 看看，或清理后重试）"
+    fi
+
+    trial_ok "$src" || die "新程序无法在这台路由器上运行，已放弃（原版本未动）"
+    old=$(ver_of "$BIN_DST"); new=$(ver_of "$src")
+    if [ "$old" = "$new" ] && cmp -s "$src" "$BIN_DST" && [ "$FORCE" != "1" ]; then
+        say "当前已经是这个版本（$old），无需升级。（强制重装：FORCE=1 cfpilot-ctl upgrade …）"
+        rm -f /tmp/cfpilot-upgrade.bin
+        return 0
+    fi
+    say "升级：$old  →  $new"
+
+    do_backup
+    if install_binary "$src"; then
+        rm -f /tmp/cfpilot-upgrade.bin
+        say "升级完成：$(ver_of "$BIN_DST")（旧版本保留在 $PREV_BIN，可用 cfpilot-ctl rollback 回退）"
+        install_luci >/dev/null 2>&1
+        show_url
+        return 0
+    fi
+    rm -f /tmp/cfpilot-upgrade.bin
+    return 1
+}
+
+do_rollback() {
+    [ -x "$PREV_BIN" ] || die "没有可回退的旧版本"
+    trial_ok "$PREV_BIN" || die "旧版本文件无法运行"
+    say "回退：$(ver_of "$BIN_DST")  →  $(ver_of "$PREV_BIN")"
+    cur="/tmp/cfpilot-current.bin"
+    cp "$BIN_DST" "$cur"
+    "$INIT" stop >/dev/null 2>&1
+    cp "$PREV_BIN" "$BIN_DST" && chmod 755 "$BIN_DST"
+    cp "$cur" "$PREV_BIN" && chmod 755 "$PREV_BIN"
+    rm -f "$cur"
+    "$INIT" start
+    if healthy; then say "回退完成：$(ver_of "$BIN_DST")"; show_url; else die "回退后没有正常运行：logread -e cfpilot"; fi
+}
+
+do_status() {
+    if pidof cfpilot >/dev/null 2>&1; then
+        pid=$(pidof cfpilot | awk '{print $1}')
+        say "cfpilot：运行中，PID=$pid"
+        grep -E "VmRSS|VmPeak" "/proc/$pid/status" 2>/dev/null
+    else
+        say "cfpilot：未运行"
+    fi
+    if pidof cfpilot-watchdog >/dev/null 2>&1 || ps 2>/dev/null | grep -q "[c]fpilot-watchdog"; then
+        say "看门狗：运行中"
+    else
+        say "看门狗：未运行"
+    fi
+    say "程序版本：$(ver_of "$BIN_DST")"
+    [ -x "$PREV_BIN" ] && say "上一版本：$(ver_of "$PREV_BIN")（可 cfpilot-ctl rollback）"
+    awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} /^MemFree:/{f=$2} END{ if(a=="") a=f; printf "系统内存：共 %d MB，可用约 %d MB\n", t/1024, a/1024 }' /proc/meminfo
+    c=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null); m=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)
+    [ -n "$c" ] && say "连接跟踪表：$c / $m"
+    say "负载：$(cut -d' ' -f1-3 /proc/loadavg)"
+    say "程序日志占用：$(du -sk "$DATA_DIR"/cfpilot.log* 2>/dev/null | awk '{s+=$1} END{print s+0}') KB（上限约 1 MB，自动轮转）"
+    if crontab -l 2>/dev/null | grep -q "cfpilot-autoupdate"; then say "自动升级：已开启"; else say "自动升级：未开启"; fi
+}
+
+do_autoupdate() {
+    case "$1" in
+    on)
+        [ -f "$UP_CONF" ] && . "$UP_CONF"
+        [ -n "$UPGRADE_URL" ] || die "请先在 $UP_CONF 里填写 UPGRADE_URL（升级文件的下载网址）"
+        tmpc=$(mktemp)
+        crontab -l 2>/dev/null | grep -v "cfpilot-autoupdate" > "$tmpc"
+        echo "30 4 * * 1 $CTL_DST upgrade >> /tmp/cfpilot-upgrade.log 2>&1 # cfpilot-autoupdate" >> "$tmpc"
+        crontab "$tmpc"; rm -f "$tmpc"
+        /etc/init.d/cron enable >/dev/null 2>&1; /etc/init.d/cron restart >/dev/null 2>&1
+        say "已开启：每周一 04:30 自动升级（失败会自动回滚；记录在 /tmp/cfpilot-upgrade.log）"
+        ;;
+    off)
+        tmpc=$(mktemp)
+        crontab -l 2>/dev/null | grep -v "cfpilot-autoupdate" > "$tmpc"
+        crontab "$tmpc"; rm -f "$tmpc"
+        say "已关闭自动升级"
+        ;;
+    *) die "用法：cfpilot-ctl autoupdate on|off" ;;
+    esac
+}
+
+do_uninstall() {
+    remove_luci
+    [ -x "$INIT" ] && { "$INIT" stop; "$INIT" disable; }
+    tmpc=$(mktemp); crontab -l 2>/dev/null | grep -v "cfpilot-autoupdate" > "$tmpc"; crontab "$tmpc" 2>/dev/null; rm -f "$tmpc"
+    rm -f "$INIT" "$BIN_DST" "$WD_DST" "$CTL_DST" "$URL_FILE" "$MEM_LOG"
+    say "已卸载。数据目录 $DATA_DIR 已保留（里面有你的 Token 与配置，确定不要了再手动删除）。"
+}
+
+do_install() {
+    src="$DEFAULT_SRC"
+    [ -n "$1" ] && src="$1"
+    [ -f "$src" ] || die "找不到 $src。请先把 cfpilot-kwrt-armv7 上传到路由器的 /tmp 目录，再重新运行本脚本。"
+    is_elf "$src" || die "$src 不是可执行程序，可能上传损坏"
+    case "$(uname -m)" in armv7*|armv6*) ;; *) say "警告：这台设备架构是 $(uname -m)，本程序为 armv7l 编译，可能无法运行。" ;; esac
+
+    need=$(( $(wc -c < "$src") / 1024 * 2 + 1024 ))
+    have=$(free_kb /usr/bin)
+    if [ -n "$have" ] && [ "$have" -lt "$need" ] 2>/dev/null; then
+        die "空间不足：需要约 ${need}KB，/usr/bin 只剩 ${have}KB"
+    fi
+
+    old=""; [ -x "$BIN_DST" ] && old=$(ver_of "$BIN_DST")
+    [ -n "$old" ] && { say "检测到已安装 $old，按升级流程处理（数据保留）"; do_backup; }
+
+    if install_binary "$src"; then
+        # 复制自身为 cfpilot-ctl，以后随时可用
+        if [ -f "$0" ] && [ "$(readlink -f "$0" 2>/dev/null)" != "$CTL_DST" ]; then
+            cp "$0" "$CTL_DST" && chmod 755 "$CTL_DST"
+        fi
+        keep_on_sysupgrade
+        install_luci
+        show_url
+        say "完成。常用命令：cfpilot-ctl status | mem | logs | upgrade | rollback | autoupdate on"
+        say "资源看门狗已启用：内存 / 连接表异常时只重启 cfpilot（参数见 $WD_CONF）"
+        return 0
+    fi
+    return 1
+}
+
+# ---------------- 入口 ----------------
+# 测试用：CFPILOT_CTL_LIB=1 时只加载函数不执行命令
+if [ "$CFPILOT_CTL_LIB" = "1" ]; then return 0 2>/dev/null; fi
+
+case "$1" in
+url) show_url ;;
+status) do_status ;;
+mem)
+    if [ -s "$MEM_LOG" ]; then tail -n 20 "$MEM_LOG"; else say "还没有采样记录（看门狗每 5 分钟采样一次；刚启动请稍等）"; fi
+    ;;
+logs)
+    n="${2:-60}"
+    if [ -f "$DATA_DIR/cfpilot.log" ]; then tail -n "$n" "$DATA_DIR/cfpilot.log"; else logread -e cfpilot | tail -n "$n"; fi
+    ;;
+upgrade) do_upgrade "$2" ;;
+rollback) do_rollback ;;
+backup) do_backup ;;
+autoupdate) do_autoupdate "$2" ;;
+luci) install_luci ;;
+uninstall) do_uninstall ;;
+help|-h|--help) sed -n '2,25p' "$0" ;;
+""|install) do_install "$2" ;;
+*)
+    # 兼容：直接给一个文件路径 = 安装 / 升级
+    if [ -f "$1" ]; then do_install "$1"; else die "未知命令：$1（cfpilot-ctl help 查看用法）"; fi
+    ;;
+esac

@@ -1,0 +1,20 @@
+{
+	"luci-app-cfpilot": {
+		"description": "Grant access to CFPilot",
+		"read": {
+			"file": {
+				"/tmp/cfpilot.url": [ "read" ],
+				"/proc/*/status": [ "read" ],
+				"/etc/rc.d/S99cfpilot": [ "read", "list" ],
+				"/bin/pidof": [ "exec" ],
+				"/sbin/logread": [ "exec" ],
+				"/usr/bin/cfpilot": [ "exec" ]
+			}
+		},
+		"write": {
+			"file": {
+				"/etc/init.d/cfpilot": [ "exec" ]
+			}
+		}
+	}
+}
