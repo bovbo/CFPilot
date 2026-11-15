@@ -1,0 +1,13 @@
+{
+	"admin/services/cfpilot": {
+		"title": "CFPilot",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "cfpilot/main"
+		},
+		"depends": {
+			"acl": [ "luci-app-cfpilot" ]
+		}
+	}
+}
