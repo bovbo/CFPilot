@@ -190,6 +190,11 @@ func (s *Server) runScheduledTask(ctx context.Context, task schedule.Task) {
 		}
 	}
 	s.finishScheduledTask(task, status, message, len(entries), host)
+	// 1:N：优选成功后自动重新验证并推送到各数据面（失败只记日志，不影响本任务状态）。
+	// entries 已按速度排序，dpAutoPush 内按设置截取前 N 条。
+	if len(entries) > 0 {
+		s.dpAutoPush(schedule.CopyLines(entries), "schedule")
+	}
 }
 
 // executeScheduledTask 跑一轮优选并把结果写进本地池。
@@ -316,6 +321,9 @@ func (s *Server) executeScheduledTask(ctx context.Context, task schedule.Task) (
 	if err != nil {
 		return nil, nil, "", err
 	}
+
+	// 固定默认优选域名：参与测速，只作记录（不影响它们进订阅池）
+	s.recordFixedDomains(ctx, host, wsPath, m.Credentials.UUID, m.Credentials.TrojanPassword)
 
 	// ---- 5. 写优选历史（与手动优选同一套留底，便于回看与复测）----
 	s.saveScanHistory("scheduled", host, wsPath, scan.ProbeDefaultPath,

@@ -412,6 +412,10 @@ func (s *Server) routes() http.Handler {
 		s.registerScheduleRoutes(mux)
 	}
 
+	// 1:N 多数据面管理 API
+	s.registerDPRoutes(mux)
+	s.registerKwrtUpdateRoutes(mux)
+
 	// 反代优选（出站链路体检）API
 	s.registerRelayRoutes(mux)
 

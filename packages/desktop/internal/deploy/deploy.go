@@ -75,6 +75,15 @@ type Options struct {
 	// 空串 = **沿用清单里记录的形态**（没有清单则 pages）。
 	// 与「显式传 pages」不同：后者对 Workers 实例来说是一次形态切换。
 	DataPlaneMode string
+	// DataOnly 只部署数据面：不创建 / 不配置 / 不部署控制面（1:N 多数据面用，
+	// 各账号只放一个数据面 Worker，控制面只有一个）。
+	//
+	// 安全约定：
+	//   - 账号里没有清单 → 首次部署，清单里的控制面项目名为空串；
+	//   - 清单是「纯数据面」（控制面为空）→ 原地更新；
+	//   - 清单属于完整实例（有控制面）且是自动模式 → 只更新数据面，不碰控制面；
+	//   - 指定了 fresh 而清单已存在 → 仍按归属校验拒绝（不会越界覆盖）。
+	DataOnly bool
 	// KeepCredentials 更新时沿用清单里的 UUID / WS 路径（默认 true）
 	KeepCredentials bool
 	// SkipSameVersion 本地版本与线上一致时跳过部署（默认 true）
@@ -364,7 +373,7 @@ func (d *Deployer) Run(ctx context.Context) (*Result, error) {
 	// 空串会被误判成 owned → 「全新部署」复用同一个 KV 时，
 	// 会把另一个现役实例的清单认成自己的 → 用新凭据覆盖 CONFIG
 	// → 老实例的客户端节点全部失效（跨账户串号）。
-	if controlName == "" {
+	if controlName == "" && !d.opt.DataOnly {
 		controlName = RandomWorkerName()
 	}
 	if dataName == "" {
@@ -466,14 +475,16 @@ func (d *Deployer) Run(ctx context.Context) (*Result, error) {
 		d.setSlotSubdomain(label, proj.Subdomain)
 	}
 
-	ensurePagesProject("控制面", controlName)
+	if !d.opt.DataOnly {
+		ensurePagesProject("控制面", controlName)
+	}
 	if dataMode == "pages" {
 		ensurePagesProject("数据面", dataName)
 	} else {
 		d.log("· 数据面部署形态：Workers（不创建 Pages 数据面项目）")
 	}
 	// ---------------- 2. 配置环境变量与 KV（必须在部署前） ----------------
-	if d.result.Control.Subdomain != "" {
+	if d.result.Control.Subdomain != "" && !d.opt.DataOnly {
 		d.configureProject(ctx, controlName, "控制面", eff)
 	}
 	if dataMode == "pages" && d.result.Data.Subdomain != "" {
@@ -598,24 +609,25 @@ func (d *Deployer) Run(ctx context.Context) (*Result, error) {
 	// 控制面的环境变量是**部署前**配好的，那时 DATA_HOST 还是旧域名。
 	// 数据面因 8000119 换名重建后域名变了 → 控制面 DATA_HOST 仍指向
 	// **已删除的旧域名** → 订阅里 sni/host 全部指向不存在的域名 → 所有节点失效。
-	if d.result.Data.Subdomain != "" && d.result.Control.Name != "" {
+	if d.result.Data.Subdomain != "" && d.result.Control.Name != "" && !d.opt.DataOnly {
 		d.syncControlDataHost(ctx, eff)
 	}
 
 	// ---------------- 3b. 部署控制面 ----------------
-	controlAttempt := d.deployOnce(ctx, deployAttemptParams{
+	if d.opt.DataOnly {
+		d.log("· 仅数据面模式：不部署控制面")
+	} else if controlAttempt := d.deployOnce(ctx, deployAttemptParams{
 		preferredName: controlName,
 		code:          d.opt.ControlScript,
 		label:         "控制面",
 		eff:           eff,
-	})
-	if controlAttempt != nil {
+	}); controlAttempt != nil {
 		d.result.Control.Name = controlAttempt.project
 		d.result.Control.Subdomain = controlAttempt.subdomain
 	}
 
 	// ---------------- 4. 写回部署清单 ----------------
-	if d.result.Control.Subdomain != "" && d.result.Data.Subdomain != "" {
+	if (d.result.Control.Subdomain != "" || d.opt.DataOnly) && d.result.Data.Subdomain != "" {
 		if err := d.writeManifest(ctx, manifest, eff, dataCustomDomain); err != nil {
 			d.warn("写入部署清单失败：" + err.Error())
 		} else {
@@ -639,7 +651,7 @@ func (d *Deployer) validate() error {
 	if strings.TrimSpace(d.opt.KVNamespaceID) == "" {
 		problems = append(problems, "缺少 KV 命名空间 ID")
 	}
-	if len(d.opt.ControlScript) == 0 {
+	if len(d.opt.ControlScript) == 0 && !d.opt.DataOnly {
 		problems = append(problems, "控制面产物为空（control.js）")
 	}
 	if len(d.opt.DataScript) == 0 {

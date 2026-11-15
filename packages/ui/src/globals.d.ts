@@ -413,6 +413,21 @@ interface Window {
      */
     quickScan(): Promise<QuickScanResult>
 
+    /* ---------------- 1:N 多数据面（数据面管理页） ---------------- */
+    dpList(withPools?: boolean): Promise<DpListResult>
+    dpSave(plane: DpSaveRequest): Promise<{ ok: boolean; plane?: DpPlaneView; warning?: string; pushStarted?: boolean; error?: string }>
+    dpDelete(id: string): Promise<{ ok: boolean; warning?: string; error?: string }>
+    dpSyncDeploy(id: string): Promise<{ ok: boolean; plane?: DpPlaneView; warning?: string; error?: string }>
+    dpPush(ids?: string[], mode?: string, lines?: string[]): Promise<{ ok: boolean; started?: boolean; mode?: string; count?: number; error?: string }>
+    dpRemoveIps(id: string, ips: string[]): Promise<{ ok: boolean; result?: DpPushRecordView; error?: string }>
+    dpSettings(settings: DpSettingsView): Promise<{ ok: boolean; settings?: DpSettingsView; error?: string }>
+    dpDeploy(ids?: string[], opts?: { force?: boolean; dataPlaneMode?: string }): Promise<{ ok: boolean; started?: boolean; count?: number; skippedPrecheck?: string[]; note?: string; error?: string }>
+
+    /* ---------------- 路由器版：一键更新 ---------------- */
+    kwrtUpdateCheck(): Promise<{ supported: boolean; current?: string; latest?: string; update?: boolean; error?: string }>
+    kwrtUpdateApply(): Promise<{ ok: boolean; started?: boolean; error?: string }>
+    kwrtUpdateStatus(): Promise<{ supported: boolean; state?: string; log?: string }>
+
     /* ---------------- 外部 IP 数据源（Phase 5） ---------------- */
     /** 数据源配置 + 池统计 + 定时器状态，一次取齐 */
     sourcesList(): Promise<SourcesListResult>
@@ -754,6 +769,10 @@ interface Window {
     onScanResult(cb: (payload: CFPilotScanResult) => void): () => void
     /** 定时优选任务的状态变化（运行中 / 完成 / 失败 / 被跳过） */
     onTaskStatus(cb: (payload: ScheduledTaskStatus) => void): () => void
+    /** 一轮多数据面推送结束（数据面页据此自动刷新记录） */
+    onDpPush(cb: (payload: { at: number }) => void): () => void
+    /** 数据面部署 / 升级结束（带每个数据面的结果） */
+    onDpDeploy(cb: (payload: { at: number; results: DpDeployResultView[] }) => void): () => void
     /* ---------------- 反代优选（出站链路体检） ---------------- */
     /**
      * 启动反代体检（异步：结果走 `onRelayResult`）。
@@ -1350,3 +1369,88 @@ interface SourcesListResult {
 }
 
 type ExternalSourceType = 'github-raw' | 'custom-url' | 'ripe-stat'
+
+/* ---------------- 1:N 多数据面 ---------------- */
+interface DpPushRecordView {
+  at: number
+  reason: string
+  mode: string
+  status: string
+  message: string
+  checked: number
+  valid: number
+  added: number
+  pool: number
+  attempts: number
+}
+interface DpPlaneView {
+  id: string
+  name: string
+  profileId: string
+  workerName: string
+  domain: string
+  uuid: string
+  wsPath: string
+  trojanPassword: string
+  trojanPath: string
+  xhttpPath: string
+  enabled: boolean
+  autoPush: boolean
+  kernelVersion: string
+  lastDeployAt: string
+  createdAt: number
+  updatedAt: number
+  log: DpPushRecordView[]
+}
+interface DpDeployResultView {
+  id: string
+  name: string
+  ok: boolean
+  skipped: boolean
+  message: string
+  warnings?: string[]
+  kernelVersion?: string
+}
+interface DpSettingsView {
+  controlProfileId: string
+  pushAfterAdd: boolean
+  pushAfterScan: boolean
+  mode: string
+  top: number
+}
+interface DpFixedRecordView {
+  domain: string
+  ips: string[]
+  ok: boolean
+  latencyMs: number
+  speedMBps: number
+  colo: string
+  note: string
+  at: number
+}
+interface DpSaveRequest {
+  id?: string
+  name?: string
+  profileId?: string
+  workerName?: string
+  domain?: string
+  uuid?: string
+  wsPath?: string
+  trojanPassword?: string
+  trojanPath?: string
+  xhttpPath?: string
+  enabled?: boolean
+  autoPush?: boolean
+  fromDeploy?: boolean
+}
+interface DpListResult {
+  ok: boolean
+  planes: DpPlaneView[]
+  settings: DpSettingsView
+  profiles: Array<{ id: string; name: string; accountName: string; hasToken: boolean; hasKv: boolean }>
+  pools: Record<string, number>
+  poolError: string
+  pushing: boolean
+  fixedDomains: DpFixedRecordView[]
+  error?: string
+}

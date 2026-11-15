@@ -20,6 +20,10 @@ import {
 import {
   LOCAL_IPS_KEY,
   SCANNER_TOKEN_KEY,
+  dpPoolKey,
+  isValidDpId,
+  loadDpRegistry,
+  saveDpRegistry,
   loadDomainLibrary,
   loadLocalIps,
   loadRouteProfile,
@@ -269,9 +273,9 @@ export async function handleApi(
     const token = header.startsWith('Bearer ') ? header.slice(7).trim() : header.trim()
     const authorized = await verifyScanToken(store, token, env)
     if (!authorized) return error('Token 校验失败', 401)
-    let body: { ips?: unknown; mode?: unknown; target?: unknown }
+    let body: { ips?: unknown; mode?: unknown; target?: unknown; dp?: unknown }
     try {
-      body = (await request.json()) as { ips?: unknown; mode?: unknown; target?: unknown }
+      body = (await request.json()) as { ips?: unknown; mode?: unknown; target?: unknown; dp?: unknown }
     } catch {
       return error('请求体解析失败', 400)
     }
@@ -362,6 +366,64 @@ export async function handleApi(
       })
     }
 
+    // ---- 写「某个数据面的独立优选池」（1:N，键 LOCAL_PREFERRED_IPS:<dpId>）----
+    //
+    // 只动这一个数据面的池：不碰全局池、不碰 CONFIG，其它数据面完全不受影响。
+    // mode：append（增量，默认推荐）/ replace（整体替换）/ remove（按 ip:port 删除指定条目）。
+    if (typeof body.dp === 'string' && body.dp !== '') {
+      if (toRelay) return error('数据面优选池不支持 relay 目标', 400)
+      if (!isValidDpId(body.dp)) return error('数据面 id 不合法', 400)
+      const registry = await loadDpRegistry(store)
+      if (!registry.some((d) => d.id === body.dp)) return error('数据面未注册：' + body.dp, 404)
+      const key = dpPoolKey(body.dp)
+      const prevText = (await store.get(key)) ?? ''
+      const existing = prevText.split('\n').map((l) => l.trim()).filter(Boolean)
+      let merged: string[]
+      let added = 0
+      let removed = 0
+      if (body.mode === 'remove') {
+        const drop = new Set(rawLines.map(keyOf))
+        merged = existing.filter((l) => !drop.has(keyOf(l)))
+        removed = existing.length - merged.length
+      } else if (append) {
+        const seen = new Set(existing.map(keyOf))
+        const fresh = incoming.filter((line) => {
+          const k = keyOf(line)
+          if (seen.has(k)) return false
+          seen.add(k)
+          return true
+        })
+        added = fresh.length
+        merged = [...existing, ...fresh]
+      } else {
+        const seen = new Set<string>()
+        merged = incoming.filter((line) => {
+          const k = keyOf(line)
+          if (seen.has(k)) return false
+          seen.add(k)
+          return true
+        })
+        added = merged.length
+      }
+      const overLimitDp = Math.max(0, merged.length - MAX_LOCAL_IPS_ENTRIES)
+      if (overLimitDp > 0) merged = merged.slice(0, MAX_LOCAL_IPS_ENTRIES)
+      const next = merged.join('\n')
+      // 内容没变就不写 KV（免费版 1000 次写/天）
+      if (next !== prevText) await store.put(key, next)
+      return json({
+        ok: true,
+        target: 'local',
+        dp: body.dp,
+        mode: body.mode === 'remove' ? 'remove' : append ? 'append' : 'replace',
+        count: merged.length,
+        added,
+        removed,
+        invalid,
+        overLimit: overLimitDp,
+        limit: MAX_LOCAL_IPS_ENTRIES,
+      })
+    }
+
     // ---- 写「本地优选池」（独立键，订阅的 L1 来源）----
     //
     // ⚠️ KV 免费版配额是 **1000 次写/天**，而「一键优选」可能一天跑好几次
@@ -427,6 +489,35 @@ export async function handleApi(
       clearedManual,
       enabledManual: patch.poolManual === true,
     })
+  }
+
+  // ---- 1:N 数据面注册表（扫描令牌鉴权，供桌面端 / 路由器端同步）----
+  //
+  // 注册表只含「渲染订阅需要」的字段（域名 / UUID / 路径），
+  // Cloudflare Account ID / API Token / KV 等部署凭据永远不会上传到这里。
+  if (path === '/dataplanes' && (method === 'GET' || method === 'PUT')) {
+    const header = request.headers.get('Authorization') ?? ''
+    const token = header.startsWith('Bearer ') ? header.slice(7).trim() : header.trim()
+    if (!(await verifyScanToken(store, token, env))) return error('Token 校验失败', 401)
+    if (method === 'PUT') {
+      let payload: { items?: unknown }
+      try {
+        payload = (await request.json()) as { items?: unknown }
+      } catch {
+        return error('请求体解析失败', 400)
+      }
+      if (!Array.isArray(payload.items)) return error('items 必须是数组', 400)
+      const { saved, dropped } = await saveDpRegistry(store, payload.items)
+      ctx.onConfigChanged()
+      return json({ ok: true, count: saved.length, dropped })
+    }
+    const list = await loadDpRegistry(store)
+    const rows = []
+    for (const dp of list) {
+      const pool = ((await store.get(dpPoolKey(dp.id))) ?? '').split('\n').filter((l) => l.trim()).length
+      rows.push({ id: dp.id, name: dp.name, domain: dp.domain, enabled: dp.enabled, poolCount: pool })
+    }
+    return json({ ok: true, items: rows })
   }
 
   // ---- 以下接口需要面板会话 ----

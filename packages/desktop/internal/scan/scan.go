@@ -282,6 +282,53 @@ func filterByMinSpeed(entries []Entry, minSpeedMBps float64) []Entry {
 	return out
 }
 
+// RouterLimits 是「路由器档」的并发上限：小内存 / 弱 CPU 的路由器上，
+// 默认的 300 路 TCP + 64 路 TLS 会把连接跟踪表和 CPU 打满，整机卡死。
+// 0 表示该项不限制。SetRouterLimits 只在路由器版入口调用，桌面版不受影响。
+type RouterLimits struct {
+	Concurrency      int // 阶段一 TCP 并发
+	TLSConcurrency   int // TLS 握手并发
+	ProbeConcurrency int // 阶段二（WS / 真连接）并发
+	SpeedConcurrency int // 候选之间的测速并行
+	SpeedConnections int // 每个候选的测速连接数
+	ProbeLimit       int // 进入阶段二的候选数上限
+	SpeedLimit       int // 进入阶段三的候选数上限
+}
+
+var routerLimits *RouterLimits
+
+// SetRouterLimits 启用路由器档限流（进程级，启动时调一次）。
+func SetRouterLimits(l RouterLimits) { routerLimits = &l }
+
+// DefaultRouterLimits 是针对 256MB 内存 / 双核 ARMv7 路由器的保守值。
+func DefaultRouterLimits() RouterLimits {
+	return RouterLimits{
+		Concurrency: 40, TLSConcurrency: 8, ProbeConcurrency: 6,
+		SpeedConcurrency: 1, SpeedConnections: 4,
+		ProbeLimit: 80, SpeedLimit: 20,
+	}
+}
+
+func (o Options) applyRouterLimits() Options {
+	l := routerLimits
+	if l == nil {
+		return o
+	}
+	cap := func(p *int, max int) {
+		if max > 0 && *p > max {
+			*p = max
+		}
+	}
+	cap(&o.Concurrency, l.Concurrency)
+	cap(&o.TLSConcurrency, l.TLSConcurrency)
+	cap(&o.ProbeConcurrency, l.ProbeConcurrency)
+	cap(&o.SpeedConcurrency, l.SpeedConcurrency)
+	cap(&o.SpeedConnections, l.SpeedConnections)
+	cap(&o.ProbeLimit, l.ProbeLimit)
+	cap(&o.SpeedLimit, l.SpeedLimit)
+	return o
+}
+
 // withDefaults 补齐默认值。
 func (o Options) withDefaults() Options {
 	set := func(p *int, v int) {
@@ -336,7 +383,7 @@ func (o Options) withDefaults() Options {
 	if o.XHTTPPath == "" {
 		o.XHTTPPath = "/xhttp"
 	}
-	return o
+	return o.applyRouterLimits()
 }
 
 // Run 执行三阶扫描。

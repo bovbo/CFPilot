@@ -17,7 +17,7 @@ import type { NodeEntry, NodeSource, SubFormat, UserConfig } from './types'
 import { isIpv4, isIpv6 } from './protocols/address'
 import { base64Encode } from './util'
 import { CpuBudget } from './budget'
-import { CF_IPV4_CIDRS, CURATED_OFFICIAL_IPS, PREFERRED_DOMAINS, coloLabel, countryOfColo, isKnownCountry } from './data/pools'
+import { CF_IPV4_CIDRS, CURATED_OFFICIAL_IPS, FIXED_PREFERRED_DOMAINS, PREFERRED_DOMAINS, coloLabel, countryOfColo, isKnownCountry } from './data/pools'
 import { buildBuiltinRules, renderRouteSections, ROUTE_MAIN_GROUP } from './route-profile'
 
 export type { SubFormat }
@@ -212,6 +212,12 @@ export function parseAddList(text: string): NodeEntry[] {
     if (clean) out.push(toEntry(clean, 'add'))
   }
   return out
+}
+
+/** 固定默认优选域名 → 节点条目（备注：固定-<首段>） */
+export function buildFixedEntries(): NodeEntry[] {
+  const lines = FIXED_PREFERRED_DOMAINS.map((d) => `${d}:443#固定-${d.split('.')[0]}`).join('\n')
+  return parseLocalList(lines).map((e) => ({ ...e, fixed: true }))
 }
 
 /** 解析本地真连接优选池 */
@@ -681,6 +687,7 @@ export function filterByCountries(entries: NodeEntry[], countries: string[]): No
   if (countries.length === 0) return entries
   const wanted = new Set(countries)
   return entries.filter((entry) => {
+    if (entry.fixed) return true // 固定默认域名不参与国家筛选
     const country = entry.country || countryOfColo(entry.colo)
     return country !== '' && wanted.has(country)
   })
@@ -752,7 +759,9 @@ export function finalizeGroups(
   maxNodes: number
 ): { groups: PoolGroup[]; nodes: NodeEntry[]; deduped: number; limited: number } {
   const seen = new Set<string>()
-  const cap = maxNodes > 0 ? maxNodes : Number.POSITIVE_INFINITY
+  // maxNodes 只限制「普通节点」；固定默认域名永远保留、不占这个额度
+  const plainCap = maxNodes > 0 ? maxNodes : Number.POSITIVE_INFINITY
+  let plainKept = 0
   const outNodes: NodeEntry[] = []
   const outGroups: PoolGroup[] = []
   let deduped = 0
@@ -766,9 +775,12 @@ export function finalizeGroups(
         continue
       }
       seen.add(key)
-      if (outNodes.length >= cap) {
-        limited++
-        continue
+      if (!entry.fixed) {
+        if (plainKept >= plainCap) {
+          limited++
+          continue
+        }
+        plainKept++
       }
       kept.push(entry)
       outNodes.push(entry)
@@ -996,8 +1008,12 @@ export async function collectNodes(
   const local = parseLocalList(localIpsText)
   const add = parseAddList(config.add)
   const manualEnabled = anyChecked ? config.poolManual : false
-  const manual = manualEnabled ? [...local, ...add] : []
-  if (manualEnabled && manual.length === 0) {
+  // 固定默认优选域名：永远在自定义池里（排在最前，其它来源里的同名条目让位给它）
+  const fixedEntries = buildFixedEntries()
+  const fixedKeys = new Set(fixedEntries.map((e) => `${e.ip}:${e.port}`))
+  const dropFixedDup = (list: NodeEntry[]): NodeEntry[] => list.filter((e) => !fixedKeys.has(`${e.ip}:${e.port}`))
+  const manual = [...fixedEntries, ...(manualEnabled ? dropFixedDup([...local, ...add]) : [])]
+  if (manualEnabled && local.length + add.length === 0) {
     errors.push('手动优选 IP 为空：请先跑一次本地真连接优选，或在「手动优选」里填入 IP')
   }
 
@@ -1068,11 +1084,11 @@ export async function collectNodes(
   }
 
   const sourceParts = [
-    { key: 'official' as const, entries: official },
-    { key: 'domain' as const, entries: domain },
+    { key: 'official' as const, entries: dropFixedDup(official) },
+    { key: 'domain' as const, entries: dropFixedDup(domain) },
     { key: 'manual' as const, entries: manual },
-    { key: 'api' as const, entries: addapi },
-    { key: 'csv' as const, entries: addcsv },
+    { key: 'api' as const, entries: dropFixedDup(addapi) },
+    { key: 'csv' as const, entries: dropFixedDup(addcsv) },
   ]
 
   let groups = buildGroups(sourceParts)
@@ -1227,6 +1243,22 @@ export function resolveSubVariants(
 export const WS_ONLY_VARIANTS: readonly SubVariant[] = ['vless-ws', 'trojan']
 
 /** 把节点分组（若无分组信息则整体作为一组） */
+/**
+ * 节点实际使用的连接参数：属于某个数据面（entry.dp）的节点用该数据面自己的
+ * 域名 / UUID / 路径；没有 dp 的节点沿用全局配置（单数据面旧行为，完全不变）。
+ */
+function eff(entry: NodeEntry, ctx: RenderContext) {
+  const d = entry.dp
+  return {
+    domain: d?.domain || ctx.domain,
+    uuid: d?.uuid || ctx.config.uuid,
+    wsPath: d?.wsPath || ctx.config.wsPath,
+    trojanPassword: d?.trojanPassword || ctx.config.trojanPassword,
+    trojanPath: d?.trojanPath || ctx.config.trojanPath,
+    xhttpPath: d?.xhttpPath || ctx.config.xhttpPath,
+  }
+}
+
 function resolveGroups(ctx: RenderContext): PoolGroup[] {
   if (ctx.groups && ctx.groups.length > 0) return ctx.groups
   return [{ key: 'official', name: '节点', entries: ctx.nodes }]
@@ -1392,13 +1424,14 @@ export function vlessUri(
   transport: 'ws' | 'xhttp',
   label?: string
 ): string {
-  const path = transport === 'xhttp' ? ctx.config.xhttpPath : ctx.config.wsPath
+  const E = eff(entry, ctx)
+  const path = transport === 'xhttp' ? E.xhttpPath : E.wsPath
   const params = new URLSearchParams()
   params.set('encryption', 'none')
   params.set('security', 'tls')
-  params.set('sni', ctx.domain)
+  params.set('sni', E.domain)
   params.set('type', transport)
-  params.set('host', ctx.domain)
+  params.set('host', E.domain)
   params.set('path', path)
   if (transport === 'xhttp') {
     // XHTTP 的模式必须选 packet-up（兼容性最强）：
@@ -1428,20 +1461,21 @@ export function vlessUri(
   const name = encodeURIComponent(label ?? nodeLabel(entry, 'vless', ctx.nodes.indexOf(entry)))
   // 协议名运行时拼接：产物里不留完整的协议 URI 特征串（部署期静态特征查杀）
   const scheme = ['vle', 'ss'].join('')
-  return `${scheme}://${ctx.config.uuid}@${hostForUri(entry.ip)}:${entry.port}?${params.toString()}${echParam(ctx)}#${name}`
+  return `${scheme}://${E.uuid}@${hostForUri(entry.ip)}:${entry.port}?${params.toString()}${echParam(ctx)}#${name}`
 }
 
 /** 生成 Trojan 分享链接 */
 export function trojanUri(entry: NodeEntry, ctx: RenderContext, label?: string): string {
+  const E = eff(entry, ctx)
   const params = new URLSearchParams()
   params.set('security', 'tls')
-  params.set('sni', ctx.domain)
+  params.set('sni', E.domain)
   params.set('type', 'ws')
-  params.set('host', ctx.domain)
-  params.set('path', ctx.config.trojanPath)
+  params.set('host', E.domain)
+  params.set('path', E.trojanPath)
   const name = encodeURIComponent(label ?? nodeLabel(entry, 'trojan', ctx.nodes.indexOf(entry)))
   const scheme = ['tro', 'jan'].join('')
-  return `${scheme}://${encodeURIComponent(ctx.config.trojanPassword)}@${hostForUri(entry.ip)}:${entry.port}?${params.toString()}${echParam(ctx)}#${name}`
+  return `${scheme}://${encodeURIComponent(E.trojanPassword)}@${hostForUri(entry.ip)}:${entry.port}?${params.toString()}${echParam(ctx)}#${name}`
 }
 
 /**
@@ -1496,6 +1530,14 @@ export function renderClash(ctx: RenderContext): string {
    * 用户手填的节点没有 `IPv4_` 前缀，但同样应该归对组。
    */
   const familyNames: { v4: string[]; v6: string[] } = { v4: [], v6: [] }
+  /** 1:N：按数据面分桶（数据面名 → 节点名）；单数据面时为空，输出与旧版完全一致 */
+  const dpBuckets = new Map<string, string[]>()
+  const dpPush = (entry: NodeEntry, label: string): void => {
+    if (!entry.dp) return
+    const list = dpBuckets.get(entry.dp.name) ?? []
+    list.push(label)
+    dpBuckets.set(entry.dp.name, list)
+  }
   // ⚠️ Clash / mihomo **不支持 XHTTP**（XHTTP 是 Xray 专有传输），
   // 所以 XHTTP 变体在这些格式里跳过 —— 否则客户端会把它当未知 network 而失败。
   const variants = resolveSubVariants(ctx.config.subVariants, ctx.config, WS_ONLY_VARIANTS)
@@ -1515,6 +1557,7 @@ export function renderClash(ctx: RenderContext): string {
 
   for (const group of resolveGroups(ctx)) {
     group.entries.forEach((entry, index) => {
+      const E = eff(entry, ctx)
       // 分组名由 nodeLabel 自己拼（族标记开头时不留空格 → `优选IPv4_…`）
       const baseLabel = nodeLabel(entry, 'vless', index, group.name)
       const bucket = entry.ip.includes(':') ? familyNames.v6 : familyNames.v4
@@ -1525,22 +1568,23 @@ export function renderClash(ctx: RenderContext): string {
         if (wantVless) {
           allNames.push(label)
           bucket.push(label)
+          dpPush(entry, label)
           proxies.push(
             [
               `  - name: ${yamlQuote(label)}`,
               `    type: vless`,
-              `    uuid: ${ctx.config.uuid}`,
+              `    uuid: ${E.uuid}`,
               `    server: ${entry.ip}`,
               `    port: ${port}`,
               `    network: ws`,
               `    tls: true`,
-              `    servername: ${ctx.domain}`,
+              `    servername: ${E.domain}`,
               `    client-fingerprint: ${yamlFingerprint(ctx.config.clientFingerprint)}`,
               ...echLines(),
               `    ws-opts:`,
-              `      path: ${yamlQuote(ctx.config.wsPath)}`,
+              `      path: ${yamlQuote(E.wsPath)}`,
               `      headers:`,
-              `        Host: ${ctx.domain}`,
+              `        Host: ${E.domain}`,
             ].join('\n')
           )
         }
@@ -1548,22 +1592,23 @@ export function renderClash(ctx: RenderContext): string {
           const trojanLabel = `${label} Trojan`
           allNames.push(trojanLabel)
           bucket.push(trojanLabel)
+          dpPush(entry, trojanLabel)
           proxies.push(
             [
               `  - name: ${yamlQuote(trojanLabel)}`,
               `    type: trojan`,
-              `    password: ${yamlQuote(ctx.config.trojanPassword)}`,
+              `    password: ${yamlQuote(E.trojanPassword)}`,
               `    server: ${entry.ip}`,
               `    port: ${port}`,
               `    network: ws`,
               `    tls: true`,
-              `    sni: ${ctx.domain}`,
+              `    sni: ${E.domain}`,
               `    client-fingerprint: ${yamlFingerprint(ctx.config.clientFingerprint)}`,
               ...echLines(),
               `    ws-opts:`,
-              `      path: ${yamlQuote(ctx.config.trojanPath)}`,
+              `      path: ${yamlQuote(E.trojanPath)}`,
               `      headers:`,
-              `        Host: ${ctx.domain}`,
+              `        Host: ${E.domain}`,
             ].join('\n')
           )
         }
@@ -1634,6 +1679,11 @@ export function renderClash(ctx: RenderContext): string {
   // 族分组挂在主手动分组之下：想只走 IPv6（或只走 IPv4）时直接选它
   if (familyNames.v4.length > 0) lines.push('      - "优选IPv4"')
   if (familyNames.v6.length > 0) lines.push('      - "优选IPv6"')
+  // 1:N：负载均衡 + 每个数据面一个自动选择组（客户端自己分流，Worker 之间不互相转发）
+  if (dpBuckets.size > 0) {
+    lines.push('      - "数据面均衡"')
+    for (const dpName of dpBuckets.keys()) lines.push(`      - ${yamlQuote('数据面·' + dpName)}`)
+  }
   if (allNames.length === 0) lines.push('      []')
   else for (const name of allNames) lines.push(`      - ${yamlQuote(name)}`)
   if (allNames.length > 0) {
@@ -1652,6 +1702,28 @@ export function renderClash(ctx: RenderContext): string {
     lines.push('    interval: 300')
     lines.push('    proxies:')
     for (const name of allNames) lines.push(`      - ${yamlQuote(name)}`)
+
+    if (dpBuckets.size > 0) {
+      lines.push('')
+      lines.push('  - name: "数据面均衡"')
+      lines.push('    type: load-balance')
+      lines.push('    strategy: round-robin')
+      lines.push('    url: "http://www.gstatic.com/generate_204"')
+      lines.push('    interval: 300')
+      lines.push('    proxies:')
+      for (const name of allNames) lines.push(`      - ${yamlQuote(name)}`)
+      // 每个数据面一个 url-test：某个数据面整体失效时，客户端自动落到其它数据面的节点
+      for (const [dpName, members] of dpBuckets) {
+        lines.push('')
+        lines.push(`  - name: ${yamlQuote('数据面·' + dpName)}`)
+        lines.push('    type: url-test')
+        lines.push('    url: "http://www.gstatic.com/generate_204"')
+        lines.push('    interval: 300')
+        lines.push('    tolerance: 50')
+        lines.push('    proxies:')
+        for (const member of members) lines.push(`      - ${yamlQuote(member)}`)
+      }
+    }
 
     // 按地址族分组：只放该族的节点，便于「这条线路只走 IPv6」这类用法。
     // 成员按 IP 判族（见 familyNames），所以手填的节点也会正确归组。
@@ -1736,10 +1808,12 @@ export function renderSingbox(ctx: RenderContext): string {
     return { ech: { enabled: true, query_server_name: echHost } }
   }
 
+  const allDpMembers: string[] = []
   for (const group of resolveGroups(ctx)) {
     const members: string[] = []
     group.entries.forEach((entry, index) => {
       const baseLabel = `${group.name} ${nodeLabel(entry, 'vless', index, '')}`
+      const E = eff(entry, ctx)
       for (const port of portsForEntry(entry, ctx)) {
         const portSuffix = ctx.ports.length > 1 ? `:${port}` : ''
         const label = `${baseLabel}${portSuffix}`
@@ -1751,38 +1825,52 @@ export function renderSingbox(ctx: RenderContext): string {
           tag: label,
           server: entry.ip,
           server_port: port,
-          uuid: ctx.config.uuid,
+          uuid: E.uuid,
           tls: {
             enabled: true,
-            server_name: ctx.domain,
+            server_name: E.domain,
             insecure: false,
             utls: { enabled: true, fingerprint: ctx.config.clientFingerprint },
             ...echField(),
           },
-          transport: { type: 'ws', path: ctx.config.wsPath, headers: { Host: ctx.domain } },
+          transport: { type: 'ws', path: E.wsPath, headers: { Host: E.domain } },
         })
         if (wantTrojan) outbounds.push({
           type: 'trojan',
           tag: trojanTag,
           server: entry.ip,
           server_port: port,
-          password: ctx.config.trojanPassword,
+          password: E.trojanPassword,
           tls: {
             enabled: true,
-            server_name: ctx.domain,
+            server_name: E.domain,
             insecure: false,
             utls: { enabled: true, fingerprint: ctx.config.clientFingerprint },
             ...echField(),
           },
-          transport: { type: 'ws', path: ctx.config.trojanPath, headers: { Host: ctx.domain } },
+          transport: { type: 'ws', path: E.trojanPath, headers: { Host: E.domain } },
         })
       }
     })
     if (members.length > 0) groupTags.push({ tag: group.name, members })
+    if (members.length > 0 && group.entries.some((e) => e.dp)) allDpMembers.push(...members)
   }
 
   outbounds.push({ type: 'direct', tag: 'direct' })
-  for (const group of groupTags) {
+  // 1:N：全部数据面节点放进一个 urltest，客户端按延迟自动选 / 自动绕开失效数据面
+  const dpAutoTag = '数据面自动选择'
+  if (allDpMembers.length > 0) {
+    outbounds.push({
+      type: 'urltest',
+      tag: dpAutoTag,
+      outbounds: allDpMembers,
+      url: 'https://www.gstatic.com/generate_204',
+      interval: '5m',
+      tolerance: 50,
+    })
+    groupTags.unshift({ tag: dpAutoTag, members: allDpMembers })
+  }
+  for (const group of groupTags.filter((g) => g.tag !== dpAutoTag)) {
     outbounds.push({ type: 'selector', tag: group.tag, outbounds: group.members, default: group.members[0] })
   }
   outbounds.push({

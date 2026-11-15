@@ -337,6 +337,8 @@ func (s *Server) runQuickScanFor(ctx context.Context, profile *store.Profile, on
 		return QuickScanResult{OK: false, Error: "没有找到可用的 IP（可稍后重试，或先检查实例是否正常）"}
 	}
 	s.logf(fmt.Sprintf("扫描完成，%d 个可用节点", len(summary.Entries)))
+	// 固定默认优选域名：参与测速，只作记录（不影响它们进订阅池）
+	s.recordFixedDomains(scanCtx, host, wsPath, m.Credentials.UUID, m.Credentials.TrojanPassword)
 
 	// Phase 4：把完整优选结论回写本地池（只在 fromPool 模式）。
 	// 池是本地历史，与 KV 回填解耦：即使后面取令牌 / 回填失败，历史也照记。
@@ -377,6 +379,8 @@ func (s *Server) runQuickScanFor(ctx context.Context, profile *store.Profile, on
 
 	msg := fmt.Sprintf("优选 IP 成功，共有 %d 个优选 IP 已填入面板", len(lines))
 	s.logLevel(msg, "ok")
+	// 1:N：同时分发到各数据面（重新验证 + 独立池）；没登记数据面时什么都不做。
+	s.dpAutoPush(lines, "scan")
 
 	return QuickScanResult{
 		OK:      true,

@@ -1,29 +1,17 @@
 #!/usr/bin/env bash
-# 用法：build-kwrt.sh <上游源码目录(干净检出)> <输出目录> [升级地址]
-# 作用：把"我的全部功能补丁"叠到上游最新源码上 → 测试 → 构建 ARMv7 程序 + 安装脚本 + 校验文件。
-# 退出码：0 成功；2 补丁与上游冲突（需要人工重新对齐）；其它 = 测试/构建失败
+# 用法：kwrt/build.sh <仓库根目录> <输出目录> [升级地址]
+# 作用：在 kwrt-auto 分支（已含全部路由器版功能）上 测试 → 构建 ARMv7 程序 + 安装脚本 + 校验文件。
+# 退出码：0 成功；其它 = 测试/构建失败
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="$(cd "$1" && pwd)"; OUT="$(mkdir -p "$2" && cd "$2" && pwd)"
 UPURL="${3:-}"
 cd "$SRC"
 
-echo "::group::应用功能补丁"
-# 先严格检查；不行再允许三方合并（上游改了相邻行时通常能自动合并，之后仍由测试把关）
-if git apply --check "$HERE/kwrt-1n.patch" 2>/dev/null; then
-  git apply "$HERE/kwrt-1n.patch"
-elif git apply --3way "$HERE/kwrt-1n.patch"; then
-  if git diff --name-only --diff-filter=U | grep -q .; then echo "补丁出现冲突文件："; git diff --name-only --diff-filter=U; exit 2; fi
-  echo "补丁通过三方合并应用（上游相邻代码有变动，已由合并处理，下面测试会把关）"
-else
-  echo "补丁与上游最新代码冲突，需要重新对齐"; exit 2
-fi
-echo "::endgroup::"
-
 BASEVER="$(node -p "require('./package.json').version")"
 SHA="$(git rev-parse --short=7 HEAD)"
 VER="${BASEVER}+${SHA}"
-echo "上游版本：$VER"
+echo "构建版本：$VER"
 
 echo "::group::安装依赖"
 [ "${SKIP_NPM_CI:-0}" = 1 ] || npm ci --no-audit --no-fund
@@ -68,8 +56,11 @@ python3 "$HERE/installer/build.py" "$OUT/install-cfpilot-kwrt.sh" "$UPURL"
 sh -n "$OUT/install-cfpilot-kwrt.sh"
 cd "$OUT"
 sha256sum cfpilot-kwrt-armv7 > cfpilot-kwrt-armv7.sha256
+# 压缩版：路由器闪存/流量紧张，优先下载 .gz（解压后仍按 .sha256 校验原文件）
+gzip -9 -n -c cfpilot-kwrt-armv7 > cfpilot-kwrt-armv7.gz
+gzip -t cfpilot-kwrt-armv7.gz
 sha256sum cfpilot-kwrt-armv7 install-cfpilot-kwrt.sh > SHA256SUMS
 echo "$VER" > VERSION
-echo "$(git -C "$SRC" rev-parse HEAD)" > UPSTREAM_SHA
+git -C "$SRC" rev-parse HEAD > BUILD_SHA
 echo "::endgroup::"
 ls -l "$OUT"

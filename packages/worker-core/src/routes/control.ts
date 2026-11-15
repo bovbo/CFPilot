@@ -8,7 +8,7 @@
  */
 import type { Env, UserConfig } from '../types'
 import type { Store } from '../store'
-import { LOCAL_IPS_KEY, ROUTE_PROFILE_KEY, loadDomainLibrary } from '../config'
+import { LOCAL_IPS_KEY, ROUTE_PROFILE_KEY, loadDomainLibrary, loadDpRegistry, dpPoolKey } from '../config'
 import { CpuBudget } from '../budget'
 import type { RenderContext, SubFormat } from '../sub-engine'
 import {
@@ -106,11 +106,24 @@ async function handleSubscription(
   // 预算建在 KV 读之后：墙钟近似会把 I/O 等待算成 CPU，建早了会在远程池
   // 拉取期间假阳性报「CPU 预算不足」，订阅直接缺节点。
   const budget = new CpuBudget(8)
-  const collected = await collectNodes(config, localIps, {
-    budget,
-    domainPool: domainPool.length > 0 ? domainPool : undefined,
-    bypassRemoteCache: false,
-  })
+
+  // ---- 1:N 多数据面 ----
+  // 注册表为空 = 旧的单数据面行为（下面全部走原路径，输出与旧版逐字节一致）。
+  // 非空：每个启用的数据面用**自己的**优选池（LOCAL_PREFERRED_IPS:<id>）与自己的
+  // 域名 / UUID 渲染；池为空的数据面暂时借用全局池，保证刚加入就有节点可用。
+  const dps = (await loadDpRegistry(store)).filter((d) => d.enabled)
+  const dpPools = new Map<string, string>()
+  for (const dp of dps) dpPools.set(dp.id, ((await store.get(dpPoolKey(dp.id))) ?? '').trim())
+  const needGlobal = dps.length === 0 || dps.some((d) => !dpPools.get(d.id))
+
+  const emptyCollected = { nodes: [], groups: [], stats: undefined as never }
+  const collected = needGlobal
+    ? await collectNodes(config, localIps, {
+        budget,
+        domainPool: domainPool.length > 0 ? domainPool : undefined,
+        bypassRemoteCache: false,
+      })
+    : (emptyCollected as unknown as Awaited<ReturnType<typeof collectNodes>>)
 
   // 渲染条目显式上限（C-3）：collectNodes 已按 maxNodes 截断，但 maxNodes
   // 可配置为 0（不限）。订阅渲染是纯 CPU 工作（逐条拼 URI + base64），
@@ -138,6 +151,37 @@ async function handleSubscription(
         return { ...g, entries }
       })
       .filter((g) => g.entries.length > 0)
+  }
+
+  if (dps.length > 0) {
+    // 总量仍受 RENDER_NODE_LIMIT 约束，按数据面平均分配（每个至少 10 条）
+    const perDp = Math.max(10, Math.floor(RENDER_NODE_LIMIT / dps.length))
+    // DP 池只用手动池：不重复拉远程池 / 官方池 / 域名库，N 个数据面也不会放大 CPU 开销
+    const dpConfig: UserConfig = {
+      ...config,
+      poolOfficial: false,
+      poolDomain: false,
+      poolManual: true,
+      add: '',
+      addApi: '',
+      addCsv: '',
+    }
+    const outGroups: typeof collected.groups = []
+    for (const dp of dps) {
+      const text = dpPools.get(dp.id) ?? ''
+      const src = text
+        ? (await collectNodes(dpConfig, text, { budget, bypassRemoteCache: false })).groups
+        : collected.groups
+      let remaining = perDp
+      for (const g of src) {
+        if (remaining <= 0) break
+        const entries = g.entries.slice(0, remaining).map((e) => ({ ...e, dp }))
+        remaining -= entries.length
+        if (entries.length > 0) outGroups.push({ ...g, name: `${dp.name}·${g.name}`, entries })
+      }
+    }
+    renderGroups = outGroups
+    renderNodes = outGroups.flatMap((g) => g.entries)
   }
 
   // 分流规则：默认用**内核内置的 GEOSITE/GEOIP 规则**（零外部依赖、零下载）。

@@ -375,8 +375,36 @@ export interface UserConfig {
   udpDnsEndpoint: string
 }
 
+/**
+ * 数据面记录（1:N 多数据面）。
+ *
+ * 每个数据面是**独立 Cloudflare 账号**下的一个 Worker，凭据互不混用：
+ * 订阅里属于它的节点用它自己的域名 / UUID / 路径渲染。
+ * 这里只放「生成订阅需要的字段」；Account ID / API Token / KV 等部署凭据
+ * 只留在桌面端 / 路由器端，永远不进控制面 KV。
+ */
+export interface DataPlaneRecord {
+  id: string
+  name: string
+  /** 数据面自定义域名（客户端 SNI / Host） */
+  domain: string
+  uuid: string
+  wsPath: string
+  trojanPassword: string
+  trojanPath: string
+  xhttpPath: string
+  enabled: boolean
+}
+
 /** 优选节点条目 */
 export interface NodeEntry {
+  /**
+   * 固定默认优选域名（用户自己的域名）。永远进入自定义（手动）池：
+   * 不受「手动优选」勾选、国家筛选、maxNodes 截断、推送 replace 的影响。
+   */
+  fixed?: boolean
+  /** 所属数据面；缺省 = 沿用全局配置（单数据面 / 旧行为） */
+  dp?: DataPlaneRecord
   /** IP 或优选域名 */
   ip: string
   /** 端口 */

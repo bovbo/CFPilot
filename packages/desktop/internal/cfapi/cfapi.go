@@ -218,42 +218,30 @@ func readResponse(status int, body []byte) (json.RawMessage, error) {
 
 // doJSON 发 JSON 请求并解出 result。
 func (c *Client) doJSON(ctx context.Context, method, path string, payload any, out any) error {
-	var body io.Reader
+	var raw []byte
 	if payload != nil {
-		raw, err := json.Marshal(payload)
+		b, err := json.Marshal(payload)
 		if err != nil {
 			return err
 		}
-		body = bytes.NewReader(raw)
+		raw = b
 	}
-
-	req, err := http.NewRequestWithContext(ctx, method, c.apiBase+path, body)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	if payload != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	res, err := c.httpC.Do(req)
-	if err != nil {
-		return wrapNetErr(err)
-	}
-	defer func() { _ = res.Body.Close() }()
-
-	raw, err := io.ReadAll(res.Body)
-	if err != nil {
-		return wrapNetErr(err)
-	}
-	result, err := readResponse(res.StatusCode, raw)
-	if err != nil {
-		return err
-	}
-	if out == nil || len(result) == 0 {
-		return nil
-	}
-	return json.Unmarshal(result, out)
+	hasBody := payload != nil
+	return c.doWithRetry(ctx, method, out, func(rc context.Context) (*http.Request, error) {
+		var body io.Reader
+		if hasBody {
+			body = bytes.NewReader(raw)
+		}
+		req, err := http.NewRequestWithContext(rc, method, c.apiBase+path, body)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+c.token)
+		if hasBody {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		return req, nil
+	})
 }
 
 // doForm 发 multipart 请求并解出 result。
@@ -289,37 +277,159 @@ func (c *Client) doForm(
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, c.apiBase+path, &buf)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Content-Type", w.FormDataContentType())
-
-	res, err := c.httpC.Do(req)
-	if err != nil {
-		return wrapNetErr(err)
-	}
-	defer func() { _ = res.Body.Close() }()
-
-	raw, err := io.ReadAll(res.Body)
-	if err != nil {
-		return wrapNetErr(err)
-	}
-	result, err := readResponse(res.StatusCode, raw)
-	if err != nil {
-		return err
-	}
-	if out == nil || len(result) == 0 {
-		return nil
-	}
-	return json.Unmarshal(result, out)
+	formBytes := buf.Bytes()
+	contentType := w.FormDataContentType()
+	return c.doWithRetry(ctx, method, out, func(rc context.Context) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(rc, method, c.apiBase+path, bytes.NewReader(formBytes))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+c.token)
+		req.Header.Set("Content-Type", contentType)
+		return req, nil
+	})
 }
 
 // FormFile 是一个待上传的文件。
 type FormFile struct {
 	Filename string
 	Content  []byte
+}
+
+// ---------- 网络抖动自动重试 ----------
+
+// maxAttempts 是单个请求最多尝试次数（含第一次）。
+//
+// 背景：电脑 / 路由器经代理访问 api.cloudflare.com 时偶发
+// 「TLS handshake timeout」「EOF」「连接被重置」，通常重试一次就好。
+const maxAttempts = 3
+
+// getAttemptTimeout 是 GET 请求每次尝试的上限：
+// 读取类请求（列账号、列 KV 等）快失败后重试，比卡 30 秒再失败恢复得更快。
+const getAttemptTimeout = 12 * time.Second
+
+// isConnectStageErr 判断错误是否发生在「请求还没发出去」的阶段
+// （解析域名 / 建立 TCP / TLS 握手）。这类错误对任何方法重试都是安全的。
+func isConnectStageErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, k := range []string{
+		"tls handshake timeout",
+		"dial tcp",
+		"no such host",
+		"connection refused",
+		"network is unreachable",
+	} {
+		if strings.Contains(msg, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// isTransientNetErr 判断是否为可重试的临时网络错误。
+func isTransientNetErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	if isConnectStageErr(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	for _, k := range []string{
+		"eof",
+		"timeout",
+		"connection reset",
+		"forcibly closed",
+		"broken pipe",
+		"wsarecv",
+		"wsasend",
+	} {
+		if strings.Contains(msg, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// canRetry 决定某个方法遇到某个错误能否重试：
+//   - GET / HEAD / PUT 幂等，任何临时网络错误都可重试
+//   - POST / PATCH / DELETE 只在「请求还没发出去」的阶段重试，避免重复提交
+func canRetry(method string, err error) bool {
+	switch strings.ToUpper(method) {
+	case http.MethodGet, http.MethodHead, http.MethodPut:
+		return isTransientNetErr(err)
+	default:
+		return isConnectStageErr(err)
+	}
+}
+
+// doWithRetry 构造并发送请求，遇到临时网络错误自动重试（最多 maxAttempts 次），
+// 然后读取响应并解出 result。HTTP 业务错误（4xx/5xx、success=false）不重试。
+func (c *Client) doWithRetry(
+	ctx context.Context,
+	method string,
+	out any,
+	build func(rc context.Context) (*http.Request, error),
+) error {
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			// 退避 0.8s、1.6s；用户取消 / 总超时到了就立刻结束
+			select {
+			case <-ctx.Done():
+				return wrapNetErr(lastErr)
+			case <-time.After(time.Duration(attempt-1) * 800 * time.Millisecond):
+			}
+		}
+
+		rc := ctx
+		cancel := func() {}
+		if strings.EqualFold(method, http.MethodGet) {
+			rc, cancel = context.WithTimeout(ctx, getAttemptTimeout)
+		}
+
+		req, err := build(rc)
+		if err != nil {
+			cancel()
+			return err
+		}
+
+		res, err := c.httpC.Do(req)
+		var raw []byte
+		if err == nil {
+			raw, err = io.ReadAll(res.Body)
+			_ = res.Body.Close()
+		}
+		cancel()
+
+		if err != nil {
+			lastErr = err
+			if ctx.Err() == nil && attempt < maxAttempts && canRetry(method, err) {
+				continue
+			}
+			return wrapNetErr(err)
+		}
+
+		result, err := readResponse(res.StatusCode, raw)
+		if err != nil {
+			return err
+		}
+		if out == nil || len(result) == 0 {
+			return nil
+		}
+		return json.Unmarshal(result, out)
+	}
+	return wrapNetErr(lastErr)
 }
 
 // wrapNetErr 把网络错误转成用户能看懂的提示。

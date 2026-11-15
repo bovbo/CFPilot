@@ -1,0 +1,230 @@
+name: Kwrt 同步上游并构建发布
+
+# 全自动流程（全部在你自己的仓库 bovbo/CFPilot 内完成）：
+#   1. 把 main 镜像成上游 xmwengxing/CFPilot 的最新 main（只拉取、从不向上游推送）
+#   2. 把 main 合并进 kwrt-auto（路由器版功能分支）；冲突 → 开 Issue，不发布
+#   3. 类型检查 + 全部测试 + 构建 ARMv7
+#   4. 通过后推送 kwrt-auto，并发布 Release（路由器界面 / cfpilot-ctl 一键更新就取这里）
+# 构建失败时【不发布、不推送合并结果】，旧版本继续可用。
+#
+# 可选：仓库 Settings → Secrets → Actions 里加 SYNC_TOKEN（细粒度令牌：仅本仓库，
+# Contents 读写 + Workflows 读写）。上游改了 .github/workflows 时，默认令牌无权推送，需要它。
+# 路由器固定下载地址：
+#   https://github.com/<账号>/<仓库>/releases/download/kwrt-latest/cfpilot-kwrt-armv7
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '即使没有变化也强制重新构建并发布'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: kwrt-sync-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/xmwengxing/CFPilot.git
+  WORK_BRANCH: kwrt-auto
+  KEEP_VERSIONED: 3
+
+jobs:
+  sync-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: kwrt-auto
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: 配置 git 并拉取上游
+        run: |
+          set -euo pipefail
+          git config user.name "cfpilot-sync[bot]"
+          git config user.email "cfpilot-sync@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch --no-tags upstream main
+          echo "上游最新：$(git rev-parse --short=7 upstream/main)"
+
+      - name: main 镜像上游（只更新，不向上游推送）
+        run: |
+          set +e
+          # main 是上游的纯镜像，强制对齐；失败（比如上游改了工作流而令牌无权）不影响后面
+          if git push origin +refs/remotes/upstream/main:refs/heads/main; then
+            echo "main 已同步到上游 $(git rev-parse --short=7 upstream/main)"
+          else
+            echo "::warning::main 镜像推送失败（多半是上游改了 .github/workflows，需要配置 SYNC_TOKEN）。kwrt-auto 的合并与构建不受影响。"
+          fi
+          exit 0
+
+      - name: 把 main(上游) 合并进 kwrt-auto
+        id: merge
+        run: |
+          set -uo pipefail
+          BEFORE=$(git rev-parse HEAD)
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "kwrt-auto 已包含上游最新，无需合并"
+            echo "merged=no" >> "$GITHUB_OUTPUT"
+            echo "conflict=no" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git merge --no-ff --no-commit upstream/main >/dev/null 2>&1 || true
+          # 上游自己的工作流在本分支一律不要（本分支只保留 kwrt- 开头的）：冲突里的这类文件直接删除
+          for f in $(git diff --name-only --diff-filter=U); do
+            case "$f" in
+              .github/workflows/kwrt-*) ;;
+              .github/workflows/*) git rm -q -f -- "$f" ;;
+            esac
+          done
+          for f in $(git ls-files '.github/workflows/*'); do
+            case "$f" in .github/workflows/kwrt-*) ;; *) git rm -q -f -- "$f" ;; esac
+          done
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+            echo "合并冲突文件："; git diff --name-only --diff-filter=U | tee conflict.txt
+            git merge --abort || git reset --hard "$BEFORE"
+            echo "conflict=yes" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -q -m "merge: 上游 xmwengxing/CFPilot main ($(git rev-parse --short=7 upstream/main))"
+          echo "merged=yes" >> "$GITHUB_OUTPUT"
+          echo "conflict=no" >> "$GITHUB_OUTPUT"
+          echo "已合并，新提交 $(git rev-parse --short=7 HEAD)"
+
+      - name: 合并冲突 → 开 Issue 并停止
+        if: steps.merge.outputs.conflict == 'yes'
+        run: |
+          set -euo pipefail
+          SHA7=$(git rev-parse --short=7 upstream/main)
+          gh label create kwrt-sync-fail --color B60205 --description "路由器版同步失败" 2>/dev/null || true
+          if [ -z "$(gh issue list --label kwrt-sync-fail --state open --json number -q '.[0].number')" ]; then
+            {
+              echo "上游 \`$SHA7\` 合并进 kwrt-auto 时有冲突，**没有发布**，路由器继续用旧版（不受影响）。"
+              echo
+              echo "冲突文件："; echo '```'; cat conflict.txt; echo '```'
+              echo
+              echo "把本 Issue 链接发给 Claude，让它解决冲突后推送 kwrt-auto 即可（之后自动恢复）。"
+            } > issue.md
+            gh issue create --title "路由器版同步冲突：上游 $SHA7" --label kwrt-sync-fail --body-file issue.md
+          fi
+          exit 1
+
+      - name: 判断是否需要构建
+        id: plan
+        run: |
+          set -euo pipefail
+          KEY=$(git rev-parse HEAD)
+          OLD=$(gh release view kwrt-latest --json body -q .body 2>/dev/null | grep -o 'build-key: [0-9a-f]*' | head -n1 | cut -d' ' -f2 || true)
+          PREVUP=$(gh release view kwrt-latest --json body -q .body 2>/dev/null | grep -o 'upstream: [0-9a-f]*' | head -n1 | cut -d' ' -f2 || true)
+          echo "当前：$KEY；上次发布：${OLD:-无}"
+          { echo "key=$KEY"; echo "prevup=$PREVUP"; } >> "$GITHUB_OUTPUT"
+          if [ "$KEY" = "$OLD" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "build=no" >> "$GITHUB_OUTPUT"; echo "无变化，跳过"
+          else
+            echo "build=yes" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.plan.outputs.build == 'yes'
+        with:
+          node-version: 20
+
+      - uses: actions/setup-go@v5
+        if: steps.plan.outputs.build == 'yes'
+        with:
+          go-version: '1.24'
+          cache: false
+
+      - name: 测试 → 构建 ARMv7
+        id: build
+        if: steps.plan.outputs.build == 'yes'
+        run: |
+          set +e
+          URL="https://github.com/${{ github.repository }}/releases/download/kwrt-latest/cfpilot-kwrt-armv7"
+          bash kwrt/build.sh . out "$URL" 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: 推送 kwrt-auto（构建通过才推送）
+        id: push
+        if: steps.plan.outputs.build == 'yes' && steps.build.outputs.rc == '0'
+        run: |
+          set -euo pipefail
+          # 构建产物目录 out 不入库；只有存在新的合并提交时才需要推送
+          if [ "${{ steps.merge.outputs.merged }}" = "yes" ]; then
+            git push origin HEAD:refs/heads/kwrt-auto
+          fi
+
+      - name: 发布 Release
+        if: steps.plan.outputs.build == 'yes' && steps.build.outputs.rc == '0'
+        run: |
+          set -euo pipefail
+          VER=$(cat out/VERSION)                    # 例 0.50.0+abc1234
+          TAG="kwrt-v${VER/+/-}"
+          UP=$(git rev-parse upstream/main)
+          PREVUP="${{ steps.plan.outputs.prevup }}"
+          {
+            echo "CFPilot 路由器版 ARMv7（$VER）"
+            echo
+            echo "build-key: ${{ steps.plan.outputs.key }}"
+            echo "upstream: $UP"
+            echo
+            echo "### 本次包含的上游更新"
+            if [ -n "$PREVUP" ] && git cat-file -e "$PREVUP^{commit}" 2>/dev/null; then
+              git log --format='- %s' --no-merges "$PREVUP..$UP" | head -n 40
+            else
+              git log -n 10 --no-merges --format='- %s' "$UP"
+            fi
+            echo
+            echo "SHA256："
+            echo '```'
+            cat out/SHA256SUMS
+            echo '```'
+          } > notes.md
+          FILES=(out/cfpilot-kwrt-armv7 out/cfpilot-kwrt-armv7.gz out/cfpilot-kwrt-armv7.sha256 out/install-cfpilot-kwrt.sh out/SHA256SUMS out/VERSION)
+          TARGET=$(git rev-parse HEAD)
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" "${FILES[@]}" --title "Kwrt ARMv7 $VER" --notes-file notes.md --target "$TARGET"
+          if gh release view kwrt-latest >/dev/null 2>&1; then
+            gh release upload kwrt-latest "${FILES[@]}" --clobber
+            gh release edit kwrt-latest --title "Kwrt ARMv7 最新版（$VER）" --notes-file notes.md
+          else
+            gh release create kwrt-latest "${FILES[@]}" --title "Kwrt ARMv7 最新版（$VER）" --notes-file notes.md --target "$TARGET"
+          fi
+          # 只保留最近几个留档版本，其余连同标签一并清理（省空间、列表干净）
+          gh release list --limit 200 --json tagName,createdAt \
+            -q '[.[] | select(.tagName | startswith("kwrt-v"))] | sort_by(.createdAt) | reverse | .['"$KEEP_VERSIONED"':] | .[].tagName' \
+            | while read -r t; do [ -n "$t" ] && gh release delete "$t" --yes --cleanup-tag || true; done
+          # 关闭之前的同步失败 Issue（已恢复）
+          for n in $(gh issue list --label kwrt-sync-fail --state open --json number -q '.[].number'); do
+            gh issue close "$n" --comment "已恢复：$VER 构建发布成功。" || true
+          done
+
+      - name: 构建失败 → 开 Issue（旧版本保持可用）
+        if: steps.plan.outputs.build == 'yes' && steps.build.outputs.rc != '0'
+        run: |
+          set -euo pipefail
+          SHA7=$(git rev-parse --short=7 HEAD)
+          gh label create kwrt-sync-fail --color B60205 --description "路由器版同步失败" 2>/dev/null || true
+          if [ -z "$(gh issue list --label kwrt-sync-fail --state open --json number -q '.[0].number')" ]; then
+            {
+              echo "合并上游后（\`$SHA7\`）测试或构建失败，**没有发布也没有推送合并结果**，路由器继续用旧版。"
+              echo
+              echo "构建日志末尾："; echo '```'; tail -n 60 build.log; echo '```'
+              echo
+              echo "把本 Issue 链接发给 Claude 修复即可。"
+            } > issue.md
+            gh issue create --title "路由器版构建失败：$SHA7" --label kwrt-sync-fail --body-file issue.md
+          fi
+          exit 1

@@ -324,3 +324,23 @@ export function isKnownCountry(code: string): boolean {
 
 /** 全部受支持的国家代码（按 COUNTRY_COLOS 定义顺序） */
 export const SUPPORTED_COUNTRIES: readonly string[] = Object.keys(COUNTRY_COLOS)
+
+
+/**
+ * 固定默认优选域名（用户自己的优选域名）。
+ *
+ * 规则：永远进入「自定义订阅优选池」（手动池）——不论手动池是否勾选、是否清空、
+ * 优选结果如何、是否按国家筛选；桌面端 / 路由器端会对它们做测速并**只作记录**，
+ * 测速结果不会让它们被剔除。
+ */
+export const FIXED_PREFERRED_DOMAINS: readonly string[] = [
+  'sb.mao99.eu.org',
+  'sb6.mao99.eu.org',
+  'sb4.mao99.eu.org',
+  'vvv.me88.cloudns.org',
+  'vvv4.me88.cloudns.org',
+  'vvv6.me88.cloudns.org',
+  'o0o.maoii.eu.org',
+  'o0o4.maoii.eu.org',
+  'o0o6.maoii.eu.org',
+]

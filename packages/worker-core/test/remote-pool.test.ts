@@ -16,6 +16,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 import { clearRemoteTextCache, collectNodes, renderBase64 } from '../src/sub-engine'
+import { FIXED_PREFERRED_DOMAINS } from '../src/data/pools'
 import type { UserConfig } from '../src/types'
 
 /** 造一份最小可用的配置 */
@@ -180,7 +181,9 @@ describe('远程第三方优选订阅源（ADDAPI / ADDCSV）', () => {
         officialCount: 5,
         maxNodes: 6,
       }), '')
-    expect(result.nodes.length).toBe(6)
+    // maxNodes 只限制普通节点；固定默认域名永远保留、不占额度
+    expect(result.nodes.filter((n) => !n.fixed).length).toBe(6)
+    expect(result.nodes.filter((n) => n.fixed).length).toBe(FIXED_PREFERRED_DOMAINS.length)
     // 远程的节点在合并后按优先级排在官方池之后 → 被上限截掉
     const apiNodes = result.nodes.filter((n) => n.source === 'addapi')
     expect(apiNodes.length).toBe(1)
@@ -200,6 +203,6 @@ describe('远程第三方优选订阅源（ADDAPI / ADDCSV）', () => {
     expect(result.stats.official).toBe(20)
     expect(result.stats.addapi).toBe(2)
     // 远程池是**额外**追加的，与三个勾选项无关
-    expect(result.nodes.length).toBe(20 + 10 + 2)
+    expect(result.nodes.length).toBe(20 + 10 + 2 + FIXED_PREFERRED_DOMAINS.length)
   })
 })

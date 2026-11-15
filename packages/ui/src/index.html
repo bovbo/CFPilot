@@ -1280,6 +1280,7 @@
       <button type="button" data-page="deploy">🚀 部署</button>
       <button type="button" data-page="scan">⚡ 优选</button>
       <button type="button" data-page="sources">🌐 数据源</button>
+      <button type="button" data-page="dp">🛰️ 数据面</button>
       <button type="button" data-page="about">📘 说明</button>
       <button type="button" data-page="logs">📄 日志</button>
     </nav>
@@ -2211,6 +2212,118 @@
         </section>
 
         <!-- ============ 说明 ============ -->
+        <!-- ============ 数据面管理（1:N 多数据面） ============ -->
+        <section class="page" id="page-dp">
+          <div class="card">
+            <h2><span class="dot"></span>🛰️ 多数据面推送设置 <span class="badge info" id="dpBadge">0 个数据面</span></h2>
+            <p class="desc">
+              一个控制面，N 个数据面（各用各的 Cloudflare 账号）。优选结果由本机按数据面<b>分别</b>验证、分别推送，
+              互不影响：某个数据面失败只记在它自己名下。订阅由控制面聚合，客户端自行选择节点。
+            </p>
+            <div class="row">
+              <div class="field" style="flex:2"><label for="dpCtlProfile">控制面所在账号</label>
+                <select id="dpCtlProfile"><option value="">当前活跃账号</option></select>
+              </div>
+              <div class="field"><label for="dpMode">自动推送写入方式</label>
+                <select id="dpMode"><option value="append">追加（默认，去重）</option><option value="replace">替换（覆盖该数据面的池）</option></select>
+              </div>
+              <div class="field"><label for="dpTop">每个数据面推送条数</label>
+                <input type="number" id="dpTop" min="1" max="200" value="15" />
+              </div>
+            </div>
+            <div class="btn-row" style="margin-top:8px;align-items:center">
+              <label style="display:inline-flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpPushAfterAdd" checked /> 新增数据面后立即推送</label>
+              <label style="display:inline-flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpPushAfterScan" checked /> 每次优选完成后自动推送</label>
+            </div>
+            <div class="btn-row" style="margin-top:10px">
+              <button class="btn btn-primary btn-sm" id="btnDpSettingsSave" type="button">保存设置</button>
+              <span class="tip" id="dpSettingsHint" style="margin:0"></span>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2><span class="dot"></span>📋 数据面清单</h2>
+            <div class="btn-row" style="margin-bottom:8px">
+              <button class="btn btn-primary btn-sm" id="btnDpAdd" type="button">新增数据面</button>
+              <button class="btn btn-ghost btn-sm" id="btnDpRefresh" type="button">刷新（含池条数）</button>
+              <button class="btn btn-ghost btn-sm" id="btnDpPushAll" type="button">推送到全部启用的数据面</button>
+              <button class="btn btn-ghost btn-sm" id="btnDpDeployAll" type="button">部署 / 升级全部</button>
+              <select id="dpDeployPlane" title="数据面部署形态">
+                <option value="">形态：沿用已部署的</option>
+                <option value="pages">形态：Pages</option>
+                <option value="workers">形态：Workers</option>
+              </select>
+              <label style="display:inline-flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpDeployForce" /> 强制重新部署</label>
+              <span class="tip" id="dpPushState" style="margin:0"></span>
+            </div>
+            <table id="dpTable" hidden>
+              <thead><tr><th>名称</th><th>账号</th><th>域名</th><th>状态</th><th>池条数</th><th>最近推送</th><th>内核</th><th>操作</th></tr></thead>
+              <tbody id="dpBody"></tbody>
+            </table>
+            <p class="tip" style="margin-top:8px">「部署 / 升级」只动数据面：用该数据面所属账号的凭据，不碰控制面，逐个串行、失败不重试、互不影响。账号里已有的 UUID / 路径会沿用，订阅里的老节点不变。</p>
+            <p class="tip" id="dpEmpty">还没有数据面。点「新增数据面」，选择它所属的账号，再从该账号的部署读取域名 / UUID / 路径。</p>
+          </div>
+
+          <div class="card" id="dpFormCard" hidden>
+            <h2><span class="dot"></span><span id="dpFormTitle">新增数据面</span></h2>
+            <input type="hidden" id="dpFormId" />
+            <div class="row">
+              <div class="field"><label for="dpFormName">名称</label><input type="text" id="dpFormName" placeholder="如 账号B-主力" /></div>
+              <div class="field" style="flex:2"><label for="dpFormProfile">所属账号（在「凭据」页先添加）</label>
+                <select id="dpFormProfile"></select>
+              </div>
+            </div>
+            <div class="row" style="margin-top:6px">
+              <div class="field" style="flex:2"><label for="dpFormDomain">数据面域名（SNI / Host）</label><input type="text" id="dpFormDomain" placeholder="留空则从部署读取" /></div>
+              <div class="field" style="flex:2"><label for="dpFormUUID">UUID</label><input type="text" id="dpFormUUID" placeholder="留空则从部署读取" /></div>
+            </div>
+            <div class="row" style="margin-top:6px">
+              <div class="field"><label for="dpFormWs">WS 路径</label><input type="text" id="dpFormWs" placeholder="/xxxx" /></div>
+              <div class="field"><label for="dpFormTrojanPath">Trojan 路径</label><input type="text" id="dpFormTrojanPath" placeholder="可空" /></div>
+              <div class="field"><label for="dpFormXhttp">XHTTP 路径</label><input type="text" id="dpFormXhttp" placeholder="可空" /></div>
+              <div class="field"><label for="dpFormTrojanPw">Trojan 密码</label><input type="text" id="dpFormTrojanPw" placeholder="可空" /></div>
+            </div>
+            <div class="btn-row" style="margin-top:8px;align-items:center">
+              <label style="display:inline-flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpFormFromDeploy" checked /> 保存时从该账号的部署读取缺省字段</label>
+              <label style="display:inline-flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpFormEnabled" checked /> 启用</label>
+              <label style="display:inline-flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpFormAutoPush" checked /> 参与自动推送</label>
+            </div>
+            <div class="btn-row" style="margin-top:10px">
+              <button class="btn btn-primary btn-sm" id="btnDpFormSave" type="button">保存数据面</button>
+              <button class="btn btn-ghost btn-sm" id="btnDpFormCancel" type="button">取消</button>
+            </div>
+            <p class="tip" style="margin-top:6px">只有域名 / UUID / 路径会同步到控制面用于订阅；Account ID、API Token、KV 只留在本机。</p>
+          </div>
+
+          <div class="card">
+            <h2><span class="dot"></span>🧾 推送记录与 IP 管理</h2>
+            <div class="row">
+              <div class="field"><label for="dpLogPick">选择数据面</label><select id="dpLogPick"></select></div>
+            </div>
+            <table id="dpLogTable" hidden style="margin-top:8px">
+              <thead><tr><th>时间</th><th>来源</th><th>方式</th><th>结果</th><th>验证 / 通过</th><th>新增</th><th>池</th><th>尝试</th><th>说明</th></tr></thead>
+              <tbody id="dpLogBody"></tbody>
+            </table>
+            <p class="tip" id="dpLogEmpty">选择一个数据面查看它自己的推送记录。</p>
+            <div class="field" style="margin-top:10px">
+              <label for="dpRemoveIps">从所选数据面的池里删除 IP（每行一个，只影响这个数据面）</label>
+              <textarea id="dpRemoveIps" rows="3" placeholder="104.16.1.1:443&#10;1.2.3.4"></textarea>
+            </div>
+            <div class="btn-row" style="margin-top:8px">
+              <button class="btn btn-ghost btn-sm" id="btnDpRemoveIps" type="button">删除这些 IP</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2><span class="dot"></span>📌 固定优选域名（测速只作记录，永远在订阅优选池里）</h2>
+            <table id="dpFixedTable" hidden>
+              <thead><tr><th>域名</th><th>结果</th><th>延迟</th><th>速度</th><th>地区</th><th>说明</th><th>时间</th></tr></thead>
+              <tbody id="dpFixedBody"></tbody>
+            </table>
+            <p class="tip" id="dpFixedEmpty">还没有测速记录；下次优选完成后会出现。</p>
+          </div>
+        </section>
+
         <section class="page" id="page-about">
           <div class="card">
             <h2><span class="dot"></span>⬆️ 检查更新 <span class="badge info" id="updateBadge">未检查</span></h2>
@@ -2225,6 +2338,17 @@
             <div class="progress" id="updateProgressWrap" hidden><i id="updateBar"></i></div>
             <p class="tip" id="updateProgressText" style="margin-top:6px" hidden></p>
             <div class="links" id="updateNotes" hidden style="margin-top:10px"></div>
+          </div>
+
+          <div class="card" id="kwrtUpdateCard" hidden>
+            <h2><span class="dot"></span>🔄 路由器版一键更新 <span class="badge info" id="kwrtBadge">未检查</span></h2>
+            <p class="desc">从本仓库 GitHub Releases 取最新 ARMv7 程序：下载 → 校验 SHA256 → 试运行 → 替换 → 自动重启；失败自动回退，配置与数据不受影响。</p>
+            <p class="tip" id="kwrtVer">当前版本：—　最新版本：—</p>
+            <div class="btn-row">
+              <button class="btn btn-ghost" id="btnKwrtCheck">检查更新</button>
+              <button class="btn btn-primary" id="btnKwrtApply" disabled>一键更新</button>
+            </div>
+            <pre class="tip" id="kwrtLog" hidden style="margin-top:10px;white-space:pre-wrap;max-height:200px;overflow:auto"></pre>
           </div>
 
           <div class="card">

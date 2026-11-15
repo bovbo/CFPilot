@@ -11,6 +11,8 @@ import {
   taskRowHtml,
   taskStatusText,
 } from './task-rows'
+import { bindDpPage } from './dp-page'
+import { bindKwrtUpdate } from './kwrt-update'
 
 (function () {
   'use strict'
@@ -55,6 +57,9 @@ import {
   /** 切到「数据源」页时首次自动加载（切回来不重拉，避免冲掉用户勾选）。 */
   let autoLoadSources: (() => void) | null = null
 
+  /** 切到「数据面」页时首次自动加载（1:N 多数据面，见 dp-page.ts）。 */
+  let autoLoadDp: (() => void) | null = null
+
   function switchPage(name: string): void {
     document.querySelectorAll('#nav button').forEach((b) => {
       b.classList.toggle('active', (b as HTMLElement).dataset.page === name)
@@ -75,6 +80,10 @@ import {
     // 数据源页：第一次切进来时拉一次配置 / 池 / 采集记录
     if (name === 'sources' && autoLoadSources) {
       autoLoadSources()
+    }
+    // 数据面页：第一次切进来时拉一次清单与各数据面池条数
+    if (name === 'dp' && autoLoadDp) {
+      autoLoadDp()
     }
     // 部署页：切进来后重算横向滚动。
     //
@@ -809,7 +818,7 @@ import {
           .detectAccount()
           .then((acc) => {
             const url = acc && acc.accountId
-              ? 'https://dash.cloudflare.com/?account=' + acc.accountId
+              ? 'https://dash.cloudflare.com/' + acc.accountId + '/home'
               : 'https://dash.cloudflare.com/'
             return window.cfpilot.openExternal(url)
           })
@@ -6632,6 +6641,8 @@ import {
 
   document.addEventListener('DOMContentLoaded', async () => {
     bindSourcesPage()
+    autoLoadDp = bindDpPage({ log })
+    bindKwrtUpdate({ log })
     document.getElementById('nav')!.addEventListener('click', (e) => {
       const btn = (e.target as HTMLElement).closest('button[data-page]') as HTMLElement | null
       if (btn) switchPage(btn.dataset.page!)
@@ -6864,7 +6875,7 @@ import {
      */
     const pageParam = new URLSearchParams(location.search).get('page')
     if (pageParam) {
-      const valid = ['cred', 'deploy', 'scan', 'sources', 'about', 'logs']
+      const valid = ['cred', 'deploy', 'scan', 'sources', 'dp', 'about', 'logs']
       if (valid.includes(pageParam)) {
         switchPage(pageParam)
         log('已跳转到「' + pageParam + '」页')

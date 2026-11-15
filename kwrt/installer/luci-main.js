@@ -141,8 +141,16 @@ return view.extend({
 			]),
 
 			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, '升级'),
-				E('p', { 'style': 'opacity:.85' }, '在路由器 SSH 里执行：cfpilot-ctl upgrade /tmp/cfpilot-kwrt-armv7（或 cfpilot-ctl upgrade 网址）。升级会自动备份数据、自检，失败自动回滚；回退用 cfpilot-ctl rollback。')
+				E('h3', {}, '更新（来自 GitHub Releases）'),
+				E('p', { 'id': 'cfpilot-upd-info', 'style': 'opacity:.85' }, '点「检查更新」查看是否有新版本；一键更新会下载、校验、自检后替换并自动重启，失败自动回退，数据不受影响。'),
+				E('div', {}, [
+					E('button', { 'class': 'cbi-button cbi-button-action', 'style': 'margin-right:8px',
+						'click': ui.createHandlerFn(self, function () { return self.checkUpdate(); }) }, '检查更新'),
+					E('button', { 'id': 'cfpilot-upd-btn', 'class': 'cbi-button cbi-button-apply',
+						'click': ui.createHandlerFn(self, function () { return self.applyUpdate(); }) }, '一键更新')
+				]),
+				E('pre', { 'id': 'cfpilot-upd-log', 'style': 'max-height:200px;overflow:auto;white-space:pre-wrap;font-size:12px;margin-top:8px;display:none' }, ''),
+				E('p', { 'style': 'opacity:.6;font-size:12px' }, 'SSH 命令：cfpilot-ctl check / cfpilot-ctl upgrade / cfpilot-ctl rollback / cfpilot-ctl autoupdate on')
 			]),
 
 			E('div', { 'class': 'cbi-section' }, [
@@ -150,6 +158,50 @@ return view.extend({
 				E('pre', { 'style': 'max-height:340px;overflow:auto;white-space:pre-wrap;font-size:12px' }, st.log || '（暂无日志）')
 			])
 		]);
+	},
+
+	setUpd: function (text, log) {
+		var i = document.getElementById('cfpilot-upd-info');
+		if (i && text !== null) i.textContent = text;
+		var l = document.getElementById('cfpilot-upd-log');
+		if (l && log) { l.style.display = ''; l.textContent = log; }
+	},
+
+	checkUpdate: function () {
+		var self = this;
+		self.setUpd('正在检查更新…');
+		return fs.exec('/usr/bin/cfpilot-ctl', ['check']).then(function (r) {
+			var out = String(r.stdout || '').trim().split('\n').pop();
+			try {
+				var j = JSON.parse(out);
+				if (j.error) self.setUpd('检查失败：' + j.error);
+				else if (j.update) self.setUpd('发现新版本：' + j.latest + '（当前 ' + j.current + '）');
+				else self.setUpd('已是最新版本：' + j.current);
+			} catch (e) { self.setUpd('检查失败：' + out); }
+		}).catch(function (e) { self.setUpd('检查失败：' + e.message); });
+	},
+
+	applyUpdate: function () {
+		var self = this;
+		if (!confirm('确定现在更新？过程中 CFPilot 会重启几秒钟。')) return Promise.resolve();
+		self.setUpd('正在启动更新…');
+		return fs.exec('/usr/bin/cfpilot-ctl', ['upgrade-bg']).then(function () {
+			var n = 0;
+			var tick = function () {
+				return fs.exec('/usr/bin/cfpilot-ctl', ['upgrade-status']).then(function (r) {
+					var t = String(r.stdout || '').split('\n');
+					var state = (t[0] || '').split(' ')[0];
+					self.setUpd(state === 'ok' ? '更新完成' : state === 'fail' ? '更新失败（已保留旧版本）' : '更新中…', t.slice(1).join('\n'));
+					if (state === 'ok') return self.refresh();
+					if (state === 'fail' || ++n > 90) return null;
+					return new Promise(function (res) { setTimeout(res, 2000); }).then(tick);
+				}).catch(function () {
+					if (++n > 90) return null;
+					return new Promise(function (res) { setTimeout(res, 2000); }).then(tick);
+				});
+			};
+			return tick();
+		}).catch(function (e) { self.setUpd('启动更新失败：' + e.message); });
 	},
 
 	refresh: function () {

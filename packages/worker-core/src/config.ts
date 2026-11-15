@@ -1,7 +1,7 @@
 /**
  * 配置加载：KV CONFIG > 环境变量 > 内置默认值
  */
-import type { Env, UserConfig, ProxyMode
+import type { Env, UserConfig, DataPlaneRecord, ProxyMode
 } from './types'
 import { randomUuid } from './util'
 import { parsePinnedHosts } from './outbound/pinned'
@@ -11,6 +11,15 @@ import { KvStore } from './store'
 export const CONFIG_KEY = 'CONFIG'
 export const LOCAL_IPS_KEY = 'LOCAL_PREFERRED_IPS'
 export const SCANNER_TOKEN_KEY = 'SCANNER_TOKEN'
+/** 1:N 多数据面注册表（JSON 数组） */
+export const DP_REGISTRY_KEY = 'DP_REGISTRY'
+/** 每个数据面独立的优选池键前缀：LOCAL_PREFERRED_IPS:<dpId> */
+export const DP_POOL_PREFIX = 'LOCAL_PREFERRED_IPS:'
+export const DP_MAX_COUNT = 16
+export const dpPoolKey = (id: string): string => DP_POOL_PREFIX + id
+/** 数据面 id：仅小写字母 / 数字 / 连字符，1-32 位（同时用作 KV 键后缀） */
+export const isValidDpId = (id: unknown): id is string =>
+  typeof id === 'string' && /^[a-z0-9][a-z0-9-]{0,31}$/.test(id)
 /** KV 中热更新的优选域名库（每行一个域名；为空则用内置库） */
 export const POOL_DOMAIN_KEY = 'POOL_DOMAIN_LIBRARY'
 /**
@@ -593,4 +602,76 @@ export async function saveDomainLibrary(store: Store, domains: string[]): Promis
     return
   }
   await store.put(POOL_DOMAIN_KEY, cleaned.join('\n'))
+}
+
+function cleanDp(raw: unknown): DataPlaneRecord | null {
+  if (!raw || typeof raw !== 'object') return null
+  const r = raw as Record<string, unknown>
+  if (!isValidDpId(r.id)) return null
+  const s = (v: unknown, d = ''): string => (typeof v === 'string' ? v.trim() : d)
+  const domain = s(r.domain).toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '')
+  if (!domain || !/^[a-z0-9.-]+$/.test(domain)) return null
+  const path = (v: unknown, d: string): string => {
+    const p = s(v, d) || d
+    return p.startsWith('/') ? p : '/' + p
+  }
+  return {
+    id: r.id,
+    name: s(r.name, r.id).slice(0, 24) || r.id,
+    domain,
+    uuid: s(r.uuid),
+    wsPath: path(r.wsPath, '/'),
+    trojanPassword: s(r.trojanPassword),
+    trojanPath: path(r.trojanPath, '/trojan'),
+    xhttpPath: path(r.xhttpPath, '/xhttp'),
+    enabled: r.enabled !== false,
+  }
+}
+
+/** 读取数据面注册表（损坏 / 不存在 → 空数组 = 走旧的单数据面行为） */
+export async function loadDpRegistry(store: Store): Promise<DataPlaneRecord[]> {
+  try {
+    const raw = await store.get(DP_REGISTRY_KEY)
+    if (!raw) return []
+    const arr = JSON.parse(raw) as unknown
+    if (!Array.isArray(arr)) return []
+    const seen = new Set<string>()
+    const out: DataPlaneRecord[] = []
+    for (const item of arr) {
+      const dp = cleanDp(item)
+      if (!dp || seen.has(dp.id)) continue
+      seen.add(dp.id)
+      out.push(dp)
+      if (out.length >= DP_MAX_COUNT) break
+    }
+    return out
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 保存注册表。返回被清理丢弃的条目数。
+ * 被移除的数据面，其独立优选池一并删除（避免 KV 残留）。
+ */
+export async function saveDpRegistry(
+  store: Store,
+  items: unknown[]
+): Promise<{ saved: DataPlaneRecord[]; dropped: number }> {
+  const saved: DataPlaneRecord[] = []
+  const seen = new Set<string>()
+  for (const item of items) {
+    const dp = cleanDp(item)
+    if (!dp || seen.has(dp.id)) continue
+    seen.add(dp.id)
+    saved.push(dp)
+    if (saved.length >= DP_MAX_COUNT) break
+  }
+  const before = await loadDpRegistry(store)
+  const json = JSON.stringify(saved)
+  if ((await store.get(DP_REGISTRY_KEY)) !== json) await store.put(DP_REGISTRY_KEY, json)
+  for (const old of before) {
+    if (!seen.has(old.id)) await store.delete(dpPoolKey(old.id))
+  }
+  return { saved, dropped: items.length - saved.length }
 }

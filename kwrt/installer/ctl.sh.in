@@ -1,5 +1,5 @@
 #!/bin/sh
-# CFPilot 路由器版 一键安装 / 升级 / 管理脚本（Kwrt / OpenWrt，ARMv7）  v2
+# CFPilot 路由器版 一键安装 / 升级 / 管理脚本（Kwrt / OpenWrt，ARMv7）  v3
 #
 # 首次安装（SSH 里执行）：
 #   1. 把 cfpilot-kwrt-armv7 和本脚本传到路由器 /tmp
@@ -9,7 +9,10 @@
 #   cfpilot-ctl url               查看管理地址
 #   cfpilot-ctl mem               资源监控采样（最近 20 行）
 #   cfpilot-ctl logs [行数]       程序日志
+#   cfpilot-ctl check [--json]    检查是否有新版本（对比发布页 VERSION）
 #   cfpilot-ctl upgrade [文件|网址]  升级（自动备份、自检、失败自动回滚）
+#   cfpilot-ctl upgrade-bg        后台升级（网页 / LuCI 的「一键更新」用这个）
+#   cfpilot-ctl upgrade-status    查看后台升级的状态与日志
 #   cfpilot-ctl rollback          回到上一个版本
 #   cfpilot-ctl backup            备份数据（Token / 配置）
 #   cfpilot-ctl autoupdate on|off 每周自动升级（需先配置升级网址）
@@ -22,7 +25,13 @@ BIN_DST="/usr/bin/cfpilot"
 CTL_DST="/usr/bin/cfpilot-ctl"
 WD_DST="/usr/bin/cfpilot-watchdog"
 DATA_DIR="/etc/cfpilot"
-PREV_BIN="$DATA_DIR/cfpilot.prev"
+# 「上一版本」放在内存盘 /tmp：路由器闪存很紧（几十 MB），再存一份 9MB 程序不划算。
+# 代价：路由器重启后这份备份消失（升级当时的自动回滚不受影响）。
+PREV_BIN="/tmp/cfpilot.prev"
+LEGACY_PREV="$DATA_DIR/cfpilot.prev"
+UP_STATE="/tmp/cfpilot-upgrade.state"
+UP_LOG="/tmp/cfpilot-upgrade.log"
+UP_PID="/tmp/cfpilot-upgrade.pid"
 BACKUP_DIR="$DATA_DIR/backup"
 UP_CONF="$DATA_DIR/upgrade.conf"
 WD_CONF="$DATA_DIR/watchdog.conf"
@@ -55,6 +64,8 @@ trial_ok() {
 }
 
 ver_of() { "$1" --version 2>/dev/null | head -n1; }
+# 只取版本号那一段（CFPilot Kwrt 0.43.0+abc1234 (linux/arm) → 0.43.0+abc1234）
+ver_token() { "$1" --version 2>/dev/null | head -n1 | awk '{print $3}'; }
 
 port_listening() {
     hex=$(printf '%04X' "$1")
@@ -235,7 +246,7 @@ install_binary() {
 
     say "正在检查新版本是否正常运行…（最多 ${HEALTH_WAIT} 秒）"
     if healthy; then
-        rm -f "$PREV_BIN.keep"
+        rm -f "$PREV_BIN.keep" "$LEGACY_PREV" "$LEGACY_PREV.keep"
         return 0
     fi
 
@@ -271,6 +282,7 @@ show_url() {
 }
 
 # 解析升级来源：参数 > 配置的 UPGRADE_URL > 默认 /tmp 里的文件
+# 注意：本函数的标准输出就是「文件路径」（被 $(...) 捕获），提示信息必须写到标准错误。
 resolve_src() {
     arg="$1"
     [ -f "$UP_CONF" ] && . "$UP_CONF"
@@ -278,8 +290,16 @@ resolve_src() {
     [ -z "$arg" ] && [ -n "$UPGRADE_URL" ] && arg="$UPGRADE_URL"
     case "$arg" in
         http://*|https://*)
-            say "正在下载：$arg"
-            fetch "$arg" "$tmp" || die "下载失败。路由器直连 GitHub 不通的话，在 $UP_CONF 里填 GH_PROXY，或手动把文件传到 /tmp 后执行：cfpilot-ctl upgrade /tmp/cfpilot-kwrt-armv7"
+            say "正在下载：$arg" >&2
+            # 优先下载压缩包（约 1/3 大小，省流量也更不容易中断），失败再下原文件
+            rm -f "$tmp" "$tmp.gz"
+            if command -v gunzip >/dev/null 2>&1 && fetch "$arg.gz" "$tmp.gz" && gunzip -c "$tmp.gz" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+                say "已下载压缩包并解压" >&2
+            else
+                rm -f "$tmp" "$tmp.gz"
+                fetch "$arg" "$tmp" || die "下载失败。路由器直连 GitHub 不通的话，在 $UP_CONF 里填 GH_PROXY，或手动把文件传到 /tmp 后执行：cfpilot-ctl upgrade /tmp/cfpilot-kwrt-armv7"
+            fi
+            rm -f "$tmp.gz"
             # 同目录有 .sha256 就校验；没有就跳过
             if fetch "$arg.sha256" "$tmp.sha256"; then
                 want=$(awk '{print $1}' "$tmp.sha256" | head -n1)
@@ -288,7 +308,7 @@ resolve_src() {
                     rm -f "$tmp" "$tmp.sha256"
                     die "SHA256 校验不一致，已放弃（文件可能被篡改或下载不完整）"
                 fi
-                say "SHA256 校验通过"
+                say "SHA256 校验通过" >&2
             fi
             rm -f "$tmp.sha256"
             echo "$tmp"
@@ -324,13 +344,63 @@ do_upgrade() {
     do_backup
     if install_binary "$src"; then
         rm -f /tmp/cfpilot-upgrade.bin
-        say "升级完成：$(ver_of "$BIN_DST")（旧版本保留在 $PREV_BIN，可用 cfpilot-ctl rollback 回退）"
+        say "升级完成：$(ver_of "$BIN_DST")（旧版本放在内存里 $PREV_BIN，重启前可用 cfpilot-ctl rollback 回退）"
         install_luci >/dev/null 2>&1
         show_url
         return 0
     fi
     rm -f /tmp/cfpilot-upgrade.bin
     return 1
+}
+
+# 检查更新：对比「当前版本」和发布页的 VERSION 文件（与 UPGRADE_URL 同目录）
+do_check() {
+    json=0; [ "$1" = "--json" ] && json=1
+    cur=""; [ -x "$BIN_DST" ] && cur=$(ver_token "$BIN_DST")
+    latest=""; err=""
+    [ -f "$UP_CONF" ] && . "$UP_CONF"
+    case "$UPGRADE_URL" in
+        http://*|https://*)
+            if fetch "${UPGRADE_URL%/*}/VERSION" /tmp/cfpilot-latest.ver; then
+                latest=$(head -n1 /tmp/cfpilot-latest.ver | tr -d '\r\n "')
+            else
+                err="获取最新版本失败（网络不通？可在 $UP_CONF 填 GH_PROXY）"
+            fi
+            rm -f /tmp/cfpilot-latest.ver
+            ;;
+        *) err="没有配置升级网址（$UP_CONF 里的 UPGRADE_URL）" ;;
+    esac
+    upd=false
+    [ -n "$latest" ] && [ "$latest" != "$cur" ] && upd=true
+    if [ "$json" = "1" ]; then
+        printf '{"current":"%s","latest":"%s","update":%s,"error":"%s"}\n' "$cur" "$latest" "$upd" "$err"
+    else
+        say "当前版本：${cur:-未知}"
+        if [ -n "$err" ]; then say "$err"; elif [ "$upd" = "true" ]; then say "发现新版本：$latest（执行 cfpilot-ctl upgrade 升级）"; else say "已是最新版本"; fi
+    fi
+}
+
+# 后台升级：网页 / LuCI 的「一键更新」调用。脱离当前会话运行（升级会重启服务，不能被一起杀掉）。
+do_upgrade_bg() {
+    [ -x "$BIN_DST" ] || die "还没有安装"
+    if [ -f "$UP_PID" ] && kill -0 "$(cat "$UP_PID" 2>/dev/null)" 2>/dev/null; then
+        say "升级正在进行中"; return 0
+    fi
+    : > "$UP_LOG"
+    echo "running $(date +%s)" > "$UP_STATE"
+    cmd="echo \$\$ > $UP_PID; if $CTL_DST upgrade >> $UP_LOG 2>&1; then echo \"ok \$(date +%s)\" > $UP_STATE; else echo \"fail \$(date +%s)\" > $UP_STATE; fi; rm -f $UP_PID"
+    if command -v setsid >/dev/null 2>&1; then
+        setsid sh -c "$cmd" >/dev/null 2>&1 </dev/null &
+    else
+        nohup sh -c "$cmd" >/dev/null 2>&1 </dev/null &
+    fi
+    say "已开始升级（后台进行）。进度：cfpilot-ctl upgrade-status"
+}
+
+do_upgrade_status() {
+    if [ -f "$UP_STATE" ]; then cat "$UP_STATE"; else echo "idle"; fi
+    [ -f "$UP_LOG" ] && tail -n 30 "$UP_LOG"
+    return 0
 }
 
 do_rollback() {
@@ -446,12 +516,15 @@ logs)
     if [ -f "$DATA_DIR/cfpilot.log" ]; then tail -n "$n" "$DATA_DIR/cfpilot.log"; else logread -e cfpilot | tail -n "$n"; fi
     ;;
 upgrade) do_upgrade "$2" ;;
+upgrade-bg) do_upgrade_bg ;;
+upgrade-status) do_upgrade_status ;;
+check) do_check "$2" ;;
 rollback) do_rollback ;;
 backup) do_backup ;;
 autoupdate) do_autoupdate "$2" ;;
 luci) install_luci ;;
 uninstall) do_uninstall ;;
-help|-h|--help) sed -n '2,25p' "$0" ;;
+help|-h|--help) sed -n '2,28p' "$0" ;;
 ""|install) do_install "$2" ;;
 *)
     # 兼容：直接给一个文件路径 = 安装 / 升级

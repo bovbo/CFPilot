@@ -18,7 +18,7 @@ import {
   sampleFromCidrs,
   type RenderContext,
 } from '../src/sub-engine'
-import { PREFERRED_DOMAINS } from '../src/data/pools'
+import { FIXED_PREFERRED_DOMAINS, PREFERRED_DOMAINS } from '../src/data/pools'
 import { base64Decode } from '../src/util'
 import type { UserConfig } from '../src/types'
 
@@ -304,7 +304,8 @@ describe('collectNodes 一致性（C-1：订阅与预览同一口径）', () => 
       '1.1.1.1\n2.2.2.2',
       {}
     )
-    expect(result.nodes).toHaveLength(2)
+    // 固定默认域名（9 个）永远在池里，这里只数普通节点
+    expect(result.nodes.filter((n) => !n.fixed)).toHaveLength(2)
     expect(result.stats.deduped).toBe(2)
     const flat = result.groups.flatMap((g) => g.entries)
     expect(flat).toEqual(result.nodes)
@@ -326,8 +327,10 @@ describe('collectNodes 一致性（C-1：订阅与预览同一口径）', () => 
   it('maxNodes=1 时订阅 proxy 数 == 1（不再是全部）', async () => {
     const ips = Array.from({ length: 20 }, (_, i) => `10.0.${i}.1`).join('\n')
     const result = await collectNodes({ ...baseConfig, maxNodes: 1 }, ips, {})
-    expect(result.nodes).toHaveLength(1)
-    expect(result.groups.flatMap((g) => g.entries)).toHaveLength(1)
+    // maxNodes 只限制普通节点；固定默认域名永远保留
+    expect(result.nodes.filter((n) => !n.fixed)).toHaveLength(1)
+    expect(result.nodes.filter((n) => n.fixed)).toHaveLength(FIXED_PREFERRED_DOMAINS.length)
+    expect(result.groups.flatMap((g) => g.entries)).toHaveLength(1 + FIXED_PREFERRED_DOMAINS.length)
     expect(result.stats.limited).toBe(19)
   })
 })
@@ -410,10 +413,11 @@ describe('collectNodes 零配置兜底', () => {
       { ...config, poolOfficial: false, poolDomain: false, poolManual: false },
       ''
     )
-    expect(result.groups.map((g) => g.key)).toEqual(['official', 'domain'])
+    // 固定默认域名永远进入自定义（manual）池，所以多一个 manual 组
+    expect(result.groups.map((g) => g.key)).toEqual(['official', 'domain', 'manual'])
     expect(result.stats.official).toBe(20)
     expect(result.stats.domain).toBe(10)
-    expect(result.nodes).toHaveLength(30)
+    expect(result.nodes).toHaveLength(30 + FIXED_PREFERRED_DOMAINS.length)
   })
 
   it('勾选手动来源但池为空时给出可读提示', async () => {
@@ -519,10 +523,11 @@ describe('订阅输出', () => {
 })
 
 describe('端到端：默认配置渲染三种订阅', () => {
-  it('默认配置产出 30 个节点，三种格式都按来源分组', async () => {
+  it('默认配置产出 30 个普通节点 + 固定默认域名，三种格式都按来源分组', async () => {
     const collected = await collectNodes(config, '')
-    expect(collected.nodes).toHaveLength(30)
-    expect(collected.groups.map((g) => g.key)).toEqual(['official', 'domain'])
+    const TOTAL = 30 + FIXED_PREFERRED_DOMAINS.length
+    expect(collected.nodes).toHaveLength(TOTAL)
+    expect(collected.groups.map((g) => g.key)).toEqual(['official', 'domain', 'manual'])
 
     const fullCtx: RenderContext = {
       nodes: collected.nodes,
@@ -535,21 +540,21 @@ describe('端到端：默认配置渲染三种订阅', () => {
       transport: 'both',
     }
 
-    // ⚠️ 默认只勾 vless-ws → **30 个节点就是 30 条链接**（不再乘三）。
+    // ⚠️ 默认只勾 vless-ws → **节点数就是链接数**（不再乘三）。
     // 旧行为（subProtocol=both × subTransport=both）会生成 30 × 3 = 90 条，
     // 客户端里多出大量用不了的 XHTTP / Trojan 节点，测速全是 -1。
     const links = base64Decode(renderBase64(fullCtx)).split('\n')
-    expect(links).toHaveLength(30)
+    expect(links).toHaveLength(TOTAL)
     expect(links.every((l) => l.includes('sni=cfpilot.example.com'))).toBe(true)
     expect(links.every((l) => l.startsWith('vless://') && l.includes('type=ws'))).toBe(true)
 
-    // 显式勾选三种形态 → 才会展开成 90 条
+    // 显式勾选三种形态 → 才会展开成 3 × 节点数 条
     const allCtx: RenderContext = {
       ...fullCtx,
       config: { ...config, subVariants: 'vless-ws,vless-xhttp,trojan' },
     }
     const allLinks = base64Decode(renderBase64(allCtx)).split('\n')
-    expect(allLinks).toHaveLength(90)
+    expect(allLinks).toHaveLength(TOTAL * 3)
 
     // Clash 主组是扁平的：所有节点直接列在 CFPilot 组里（避免客户端只显示分组）
     const yaml = renderClash(fullCtx)
