@@ -245,7 +245,7 @@ for (const target of TARGETS) {
   //     避免每加一个配置项就去删提示文案。
   // 仍然保留上限是有意义的：它挡住「随手塞进一个大依赖」。
   // 真要再往上放，请先看 `npm run build` 的实际体积与脱敏膨胀比例。
-  const sizeBudgetKb = target.out === 'dataplane.js' ? 96 : 108
+  const sizeBudgetKb = target.out === 'dataplane.js' ? 96 : 114 // kwrt: 1:N 多数据面控制面功能放宽(上游 108)
   if (target.out !== 'worker.js' && size > sizeBudgetKb * 1024) {
     console.warn(`[worker-core] 警告：${target.label} 超过 ${sizeBudgetKb}KB 预算上限`)
   }

@@ -203,9 +203,9 @@
   /**
    * 各事件的订阅者列表。
    *
-   * ⚠️ 这里必须与后端 `s.events.publish(...)` 的**全部 8 个事件**一一对应：
+   * ⚠️ 这里必须与后端 `s.events.publish(...)` 的**全部 10 个事件**一一对应：
    * deploy-status / log / relay-progress / relay-result / scan-result /
-   * task-status / update-done / update-progress。
+   * task-status / update-done / update-progress / dp-push / dp-deploy。
    *
    * 漏一个键的后果（2026-11-05 真机）：relay-result / relay-progress 没声明，
    * 界面启动调 onRelayResult / onRelayProgress 时 subscribe() 里的
@@ -225,6 +225,8 @@
     'update-progress': [],
     'update-done': [],
     'task-status': [],
+    'dp-push': [],
+    'dp-deploy': [],
   }
 
   let es = null
@@ -548,8 +550,8 @@
           if (settled) return
           settled = true
           unsub()
-          reject(new Error('优选超时（超过 10 分钟未返回结果）'))
-        }, 10 * 60 * 1000)
+          reject(new Error('优选超时（超过 3 小时未返回结果）'))
+        }, 3 * 60 * 60 * 1000)
 
         post('/api/scan/run', params || {}).catch(function (err) {
           if (settled) return
@@ -773,6 +775,51 @@
      */
     quickScan: function () {
       return post('/api/scan/quick')
+    },
+
+    /* ---------------- 1:N 多数据面（数据面管理页） ---------------- */
+
+    /** 数据面清单 + 全局设置 + 账号列表；withPools 为真时顺带查各数据面在控制面的池条数 */
+    dpList: function (withPools) {
+      return get('/api/dp' + (withPools ? '?pools=1' : ''))
+    },
+    /** 新增 / 更新一个数据面（id 为空 = 新增） */
+    dpSave: function (plane) {
+      return post('/api/dp/save', plane || {})
+    },
+    dpDelete: function (id) {
+      return post('/api/dp/delete', { id: id })
+    },
+    /** 从该数据面所属账号的部署清单重新读取域名 / UUID / 路径 */
+    dpSyncDeploy: function (id) {
+      return post('/api/dp/sync-deploy', { id: id })
+    },
+    /** 手动推送：ids 为空 = 全部启用的数据面；mode 空 = 用全局设置；lines 空 = 用最近一次优选结果 */
+    dpPush: function (ids, mode, lines) {
+      return post('/api/dp/push', { ids: ids || [], mode: mode || '', lines: lines || [] })
+    },
+    /** 只从某一个数据面的池里删除指定 IP */
+    dpRemoveIps: function (id, ips) {
+      return post('/api/dp/ips/remove', { id: id, ips: ips || [] })
+    },
+    dpSettings: function (settings) {
+      return post('/api/dp/settings', settings || {})
+    },
+    /** 各账号独立部署 / 升级数据面（仅数据面；ids 为空 = 全部启用的；逐个串行，失败互不影响） */
+    dpDeploy: function (ids, opts) {
+      opts = opts || {}
+      return post('/api/dp/deploy', { ids: ids || [], force: !!opts.force, dataPlaneMode: opts.dataPlaneMode || '' })
+    },
+
+    /* ---------------- 路由器版：一键更新（非路由器版 supported=false） ---------------- */
+    kwrtUpdateCheck: function () {
+      return get('/api/kwrt/update/check')
+    },
+    kwrtUpdateApply: function () {
+      return post('/api/kwrt/update/apply', {})
+    },
+    kwrtUpdateStatus: function () {
+      return get('/api/kwrt/update/status')
     },
 
     /* ---------------- 外部 IP 数据源（Phase 5） ---------------- */
@@ -1197,6 +1244,16 @@
 
     onUpdateDone: function (cb) {
       return subscribe('update-done', cb)
+    },
+
+    /** 一轮多数据面推送结束（数据面页据此自动刷新记录） */
+    onDpPush: function (cb) {
+      return subscribe('dp-push', cb)
+    },
+
+    /** 数据面部署 / 升级结束（带每个数据面的结果） */
+    onDpDeploy: function (cb) {
+      return subscribe('dp-deploy', cb)
     },
 
     /** 定时优选任务的状态变化（运行中 / 完成 / 失败） */

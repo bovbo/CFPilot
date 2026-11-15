@@ -127,7 +127,7 @@ for (const artifact of ARTIFACTS) {
   // 80KB 是早期自定的数，没有平台依据；而静态脱敏会把含中文的字面量整段 base64
   // （产物里 260 个，体积 ×1.33），80KB 时控制面只剩 26 字节余量。
   // 2026-11-14 起分开预算：数据面（转发热路径）96KB，控制面（面板/配置话术多）108KB。
-  const sizeBudgetKb = artifact.name === 'dataplane.js' ? 96 : 108
+  const sizeBudgetKb = artifact.name === 'dataplane.js' ? 96 : 114 // kwrt: 1:N 多数据面控制面功能放宽(上游 108)
   if (kb > sizeBudgetKb) {
     note(`${artifact.name}: ${kb.toFixed(1)} KB 超出 ${sizeBudgetKb}KB 预算（AGENTS.md §1.4）`)
   }
