@@ -52,6 +52,13 @@ export const DEFAULT_CONFIG: UserConfig = {
   nat64: '',
   concurrentDial: true,
   dataBudgetMB: 0,
+  // 出站拨号时序（P1 #11）：此前散落在 4 个调用点的硬编码常量，
+  // 统一到这里，经 configFromEnv / mergeConfig 走 KV > env > default 三层。
+  dialConnectMs: 5000,
+  dialBudgetMs: 15_000,
+  dohBudgetMs: 1200,
+  dialStallMs: 2500,
+  relayRedialMax: 4,
   resolvePreferred: true,
   // 默认保守：只修「直连假活」，不替用户在代理出口上擅自换路
   aggressiveRedial: false,
@@ -74,7 +81,19 @@ export const DEFAULT_CONFIG: UserConfig = {
   // 「电脑网页能开、手机 app 打不开」。实测 Fastly 落地对全部 x.com
   // 子域都服务（api 404 / upload 410 都是完整 TLS+HTTP 往返），
   // 且比默认链路快 3 倍。通配与裸域是两条独立条目（通配不匹配裸域）。
-  pinnedHosts: 'x.com=151.101.194.146\n*.x.com=151.101.194.146\ncloudflare.com=r:45.76.246.192',
+  //
+  // ⚠️ 下面 3 条 `r:` 通配（2026-11-15 二次修复，真正解决手机 app 打不开）：
+  // 手机 app 的 API / 图片域名（api.x.com、api.twitter.com、pbs.twimg.com
+  // 等）解析到 Cloudflare 网段 → 直连被 TCP Loop 拒绝 → 触发假活检测 +
+  // 反代重拨竞速（DOWNLINK_STALL_MS 2.5s × 最多 4 次），实测首请求
+  // 累积 10~18 秒，超过 app 的网络超时（约 10~15s），表现为一直转圈
+  // 加载不出内容 —— **不是被 WAF 拦，是被拖超时了**。
+  // `r:` 固定反代入口让这些域名第一条路径就直接按 SNI 转发，跳过整套
+  // 竞速；实测稳定延迟从 5~18s 降到 1~3s。固定入口失败时 dial 层会自动
+  // 回落到普通反代池，不会完全断。
+  // 注意这与「固定落地 IP 通配」完全不同：`r:` 是按 SNI 转发到 CF 边缘，
+  // API 服务能正确路由；固定落地 IP 会把 app 请求发给不服务 API 的 Fastly。
+  pinnedHosts: 'x.com=151.101.194.146\n*.x.com=r:155.248.181.189\n*.twitter.com=r:155.248.181.189\n*.twimg.com=r:155.248.181.189\ncloudflare.com=r:45.76.246.192',
   useBuiltinRelay: true,
   enableTrojan: true,
   enableXhttp: true,
@@ -116,6 +135,19 @@ function bool(value: unknown, fallback: boolean): boolean {
   if (['1', 'true', 'yes', 'on'].includes(text)) return true
   if (['0', 'false', 'no', 'off'].includes(text)) return false
   return fallback
+}
+
+/**
+ * 数值夹取：时序参数必须落在安全区间。
+ *
+ * 填 0 会把代理握手超时关掉（铁律 15）、让会话永久挂起；
+ * 填超大值会顶穿 §31 的 6 连接预算与 CPU 配额。
+ * 非法/缺失一律回落默认值，绝不把用户脏数据带进运行时。
+ */
+function clampNum(value: unknown, fallback: number, min: number, max: number): number {
+  const n = num(value, fallback)
+  if (!Number.isFinite(n)) return fallback
+  return Math.max(min, Math.min(max, Math.round(n)))
 }
 
 /** 合法的代理调度模式 */
@@ -184,6 +216,11 @@ export function configFromEnv(env: Env): UserConfig {
     nat64: text(env.NAT64, ''),
     concurrentDial: bool(env.TCP_CONCURRENT_DIAL, true),
     dataBudgetMB: num(env.DATA_BUDGET_MB, DEFAULT_CONFIG.dataBudgetMB),
+    dialConnectMs: num(env.DIAL_CONNECT_MS, DEFAULT_CONFIG.dialConnectMs),
+    dialBudgetMs: num(env.DIAL_BUDGET_MS, DEFAULT_CONFIG.dialBudgetMs),
+    dohBudgetMs: num(env.DOH_BUDGET_MS, DEFAULT_CONFIG.dohBudgetMs),
+    dialStallMs: num(env.DIAL_STALL_MS, DEFAULT_CONFIG.dialStallMs),
+    relayRedialMax: num(env.RELAY_REDIAL_MAX, DEFAULT_CONFIG.relayRedialMax),
     resolvePreferred: bool(env.RESOLVE_PREFERRED, DEFAULT_CONFIG.resolvePreferred),
     aggressiveRedial: bool(env.AGGRESSIVE_REDIAL, DEFAULT_CONFIG.aggressiveRedial),
     relayPool: text(env.RELAY_POOL, ''),
@@ -273,6 +310,24 @@ export function mergeConfig(base: UserConfig, override: Partial<UserConfig>): Us
     ) {
       ;(merged as unknown as Record<string, number>)[key] = num(value, 0)
     } else if (
+      key === 'dialConnectMs' ||
+      key === 'dialBudgetMs' ||
+      key === 'dohBudgetMs' ||
+      key === 'dialStallMs' ||
+      key === 'relayRedialMax'
+    ) {
+      // 时序参数单独 clamp（见 clampNum 注释），不能走上面的 num(value, 0)：
+      // 那会把「0」当成合法值，等于关掉超时。
+      const bounds: Record<string, readonly [number, number, number]> = {
+        dialConnectMs: [1000, 20000, DEFAULT_CONFIG.dialConnectMs],
+        dialBudgetMs: [3000, 60000, DEFAULT_CONFIG.dialBudgetMs],
+        dohBudgetMs: [200, 5000, DEFAULT_CONFIG.dohBudgetMs],
+        dialStallMs: [500, 15000, DEFAULT_CONFIG.dialStallMs],
+        relayRedialMax: [1, 8, DEFAULT_CONFIG.relayRedialMax],
+      }
+      const [min, max, fb] = bounds[key]!
+      ;(merged as unknown as Record<string, number>)[key] = clampNum(value, fb, min, max)
+    } else if (
       key === 'concurrentDial' ||
       key === 'resolvePreferred' ||
       key === 'aggressiveRedial' ||
@@ -299,16 +354,17 @@ export function mergeConfig(base: UserConfig, override: Partial<UserConfig>): Us
       ;(merged as unknown as Record<string, string>)[key] = normalizeSubTokenMode(String(value))
     } else if (key === 'pinnedHosts') {
       // 固定落地映射**按域名合并**（2026-11-14）：
-      // base 侧含出厂修复（x.com / cloudflare.com），override 侧是用户在面板
-      // 写的映射。若整体覆盖，用户只为 jable.tv 配一条就会把出厂修复顶掉 ——
-      // x.com 的漂移与 cloudflare.com 的 TCP Loop 会随之复发。
-      // 语义：用户条目优先；base 里用户没写的域名条目原样保留在后面。
-      merged.pinnedHosts = mergePinnedHosts(base.pinnedHosts ?? '', String(value ?? ''))
+      // 用户条目优先；出厂修复（x.com / cloudflare.com 等）永远保留 ——
+      // 用户只为 jable.tv 配一条时，出厂修复不会被顶掉。
+      //
+      // ⚠️ 兜底来源必须是 **DEFAULT_CONFIG（纯出厂清单）**，不能是 base：
+      // base 是运行时合并值（出厂 + 用户历史条目混在一起），拿它当兜底
+      // 会让用户**删除的旧条目在下一次保存时复活** —— jable.tv 删不掉
+      // 就是这个 bug（2026-11-15 用户实测）。
+      merged.pinnedHosts = mergePinnedHosts(DEFAULT_CONFIG.pinnedHosts, String(value ?? ''))
     } else if (key === 'relayPool') {
-      // 反代入口池**按行合并**（2026-11-15）：与 pinnedHosts 同理，
-      // 出厂入口池是逐个实测过的可用入口，用户只补几条自己的入口时
-      // 不应把出厂可用入口整体顶掉。
-      merged.relayPool = mergeLineList(base.relayPool ?? '', String(value ?? ''))
+      // 反代入口池**按行合并**（2026-11-15）：同上，兜底只认纯出厂清单。
+      merged.relayPool = mergeLineList(DEFAULT_CONFIG.relayPool, String(value ?? ''))
     } else if (key === 'udpDns') {
       ;(merged as unknown as Record<string, string>)[key] = normalizeUdpDns(String(value))
     } else {

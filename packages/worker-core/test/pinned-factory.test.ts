@@ -19,14 +19,20 @@ describe('出厂 pinnedHosts 默认值', () => {
     ])
   })
 
-  it('*.x.com 通配覆盖手机 app 的子域（api.x.com 等），裸域由精确条目覆盖', () => {
-    // X 手机 app 走的是子域而不是 x.com 本身 —— 通配条目守护这条链路
-    expect(pinnedIpsFor(DEFAULT_CONFIG.pinnedHosts, 'api.x.com', 443)).toEqual([
+  it('app 子域走 r: 固定反代（跳过重拨竞速），裸域仍走 Fastly 固定落地', () => {
+    // ⚠️ 不能用「固定落地 IP 通配」覆盖 app 子域 —— Fastly 不服务 API，
+    // 会把 app 请求全打到 404（2026-11-15 实测事故）。必须是 r: 反代形态。
+    expect(pinnedRelaysFor(DEFAULT_CONFIG.pinnedHosts, 'api.x.com', 443)).toEqual([
+      { ip: '155.248.181.189', port: 443 },
+    ])
+    expect(pinnedRelaysFor(DEFAULT_CONFIG.pinnedHosts, 'pbs.twimg.com', 443)).toEqual([
+      { ip: '155.248.181.189', port: 443 },
+    ])
+    expect(pinnedIpsFor(DEFAULT_CONFIG.pinnedHosts, 'x.com', 443)).toEqual([
       { ip: '151.101.194.146', port: 443 },
     ])
-    expect(pinnedIpsFor(DEFAULT_CONFIG.pinnedHosts, 'upload.x.com', 443)).toEqual([
-      { ip: '151.101.194.146', port: 443 },
-    ])
+    // 出厂值里绝不能再出现「固定落地 IP 通配」那条有害配置
+    expect(DEFAULT_CONFIG.pinnedHosts).not.toContain('*.x.com=151.101.194.146')
   })
 
   it('configFromEnv 未设 PINNED_HOSTS 时保留出厂值', () => {
@@ -124,5 +130,22 @@ describe('出厂 relayPool（反代入口池）', () => {
     )
     const hits = merged.relayPool.split('\n').filter((l) => l === DEFAULT_CONFIG.relayPool.split('\n')[0])
     expect(hits.length).toBe(1)
+  })
+})
+
+describe('用户删除的条目不得复活（jable.tv 回归）', () => {
+  it('用户删掉自己的条目保存后，出厂兜底补充但它不会回来', () => {
+    // KV 用户层原为「jable.tv + x.com」（用户先填过），现在面板删掉 jable.tv 只剩 x.com
+    const merged = mergeConfig(DEFAULT_CONFIG, { pinnedHosts: 'x.com=151.101.194.146' })
+    expect(merged.pinnedHosts).not.toContain('jable.tv')
+    expect(merged.pinnedHosts).toContain('x.com=151.101.194.146')
+    // 出厂兜底仍在
+    expect(merged.pinnedHosts).toContain('cloudflare.com=r:45.76.246.192')
+  })
+
+  it('relayPool 同理：删掉的旧条目不复活', () => {
+    const merged = mergeConfig(DEFAULT_CONFIG, { relayPool: 'my-relay.example.com:443' })
+    expect(merged.relayPool).toContain('my-relay.example.com:443')
+    expect(merged.relayPool).toContain('155.248.181.189')
   })
 })
