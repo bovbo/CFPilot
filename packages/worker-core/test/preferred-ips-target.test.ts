@@ -19,6 +19,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { handleApi, type ApiContext } from '../src/api'
 import { DEFAULT_CONFIG, LOCAL_IPS_KEY, mergeConfig } from '../src/config'
+import { createSession, SESSION_COOKIE } from '../src/auth'
 import type { Store } from '../src/store'
 import type { UserConfig } from '../src/types'
 
@@ -91,6 +92,45 @@ async function savedConfig(): Promise<UserConfig> {
   return JSON.parse(raw ?? '{}') as UserConfig
 }
 
+// GET /config 必须返回**用户层**（剥离出厂兜底行）——
+// 回归：面板显示合并值会让用户以为出厂兜底是「手填内容」，
+// 全删保存的顾虑由此而来；实际删了保存运行时也会自动补回。
+async function getConfigBody(): Promise<UserConfig> {
+  // 面板接口要求已登录会话：先签发一个（createSession 会同时登记
+  // isolate 级 recentSessions，verifySession 能直接认出）
+  const token = await createSession(store)
+  const res = await handleApi(
+    new Request('https://panel.example.com/api/v1/config', {
+      method: 'GET',
+      headers: { Cookie: `${SESSION_COOKIE}=${token}` },
+    }),
+    new URL('https://panel.example.com/api/v1/config'),
+    ctx()
+  )
+  expect(res).not.toBeNull()
+  const json = (await res!.json()) as { ok: boolean; config: UserConfig }
+  return json.config
+}
+
+describe('面板读到的配置是用户层（出厂兜底隐形）', () => {
+  it('GET /config 的 relayPool / pinnedHosts 不含出厂行', async () => {
+    const body = await getConfigBody()
+    const factoryLines = DEFAULT_CONFIG.relayPool.split('\n').filter(Boolean)
+    const pool = (body.relayPool ?? '').split('\n').filter(Boolean)
+    expect(pool.length).toBe(0) // KV 用户层为空 → 面板显示空
+    for (const line of factoryLines) expect(pool).not.toContain(line)
+    const pinned = (body.pinnedHosts ?? '').split('\n').filter(Boolean)
+    for (const line of DEFAULT_CONFIG.pinnedHosts.split('\n').filter(Boolean)) {
+      expect(pinned).not.toContain(line)
+    }
+  })
+
+  it('运行时（读时合并）兜底仍然生效 —— 面板删空不影响出站', () => {
+    // ctx.config 是运行时合并形态：出厂行必须在
+    expect(config.relayPool.split('\n').filter(Boolean).length).toBeGreaterThanOrEqual(5)
+  })
+})
+
 describe('回填到自定义反代入口池', () => {
   it('写进 config.relayPool，不碰本地优选池', async () => {
     const { status, json } = await push({
@@ -108,12 +148,19 @@ describe('回填到自定义反代入口池', () => {
     expect(await store.get(LOCAL_IPS_KEY)).toBeNull()
   })
 
-  it('覆盖模式：先清空再写入', async () => {
+  it('覆盖模式：KV 只存用户层（覆盖清掉旧条目），读时合并补出厂兜底', async () => {
     config = mergeConfig(DEFAULT_CONFIG, { relayPool: '1.1.1.1:443' })
     store.map.set(CONFIG_KEY, JSON.stringify(config))
 
     await push({ ips: ['9.9.9.9:443'], target: 'relay' })
-    expect((await savedConfig()).relayPool).toBe('9.9.9.9:443')
+    const pool = (await savedConfig()).relayPool ?? ''
+    // KV 层只存用户层：覆盖清掉旧条目，出厂条目**不固化**进 KV
+    expect(pool).toBe('9.9.9.9:443')
+    // 运行时（读时合并）出厂兜底条目仍在
+    const runtime = mergeConfig(DEFAULT_CONFIG, { relayPool: pool })
+    for (const factoryLine of DEFAULT_CONFIG.relayPool.split('\n').filter(Boolean)) {
+      expect(runtime.relayPool).toContain(factoryLine)
+    }
   })
 
   it('增量模式：保留原有的，只补新的', async () => {
@@ -136,7 +183,10 @@ describe('回填到自定义反代入口池', () => {
     for (let i = 0; i < 260; i++) many.push(`9.9.9.${i % 256}:443`)
     const { json } = await push({ ips: many, target: 'relay' })
     expect(json.overLimit).toBeGreaterThan(0)
-    expect(((await savedConfig()).relayPool ?? '').split('\n').length).toBeLessThanOrEqual(200)
+    // KV 层截断到 200（出厂兜底不占配额、不固化进 KV，读时动态合并）
+    const kvPool = ((await savedConfig()).relayPool ?? '').split('\n')
+    expect(kvPool.length).toBeLessThanOrEqual(200)
+    expect(kvPool[0]).toContain('9.9.9.')
   })
 })
 

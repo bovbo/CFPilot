@@ -28,6 +28,7 @@ import {
   saveDomainLibrary,
   saveRouteProfile,
   readFreshConfig,
+  stripFactoryOverlays,
 } from './config'
 import { collectNodes, parseLocalList, splitValidCandidateLines } from './sub-engine'
 import { buildBuiltinProfileText, ROUTE_MAIN_GROUP } from './route-profile'
@@ -338,7 +339,14 @@ export async function handleApi(
       // config 是 15 秒缓存的（见 getConfig），拿缓存里的旧值写回去，
       // 会把用户刚在面板上改的东西覆盖掉。这里读 KV 的最新值。
       const freshConfig = await readFreshConfig(store, config)
-      await saveConfig(store, mergeConfig(freshConfig, { relayPool: merged.join('\n') }))
+      if (append) {
+        // 增量：走合并（出厂兜底条目由 saveConfig 剥离，不固化进 KV）
+        await saveConfig(store, mergeConfig(freshConfig, { relayPool: merged.join('\n') }))
+      } else {
+        // 覆盖：relayPool 用户层**直接替换** —— 不能走 mergeConfig 的合并分支，
+        // 否则旧条目会跟着保留（覆盖的语义就是「清掉旧的」）。
+        await saveConfig(store, { ...freshConfig, relayPool: merged.join('\n') })
+      }
       ctx.onConfigChanged()
       return json({
         ok: true,
@@ -454,7 +462,10 @@ export async function handleApi(
   }
 
   if (path === '/config' && method === 'GET') {
-    return json({ ok: true, config })
+    // ⚠️ 面板显示的是**用户层**（剥离出厂兜底行）：出厂兜底在读取时动态
+    // 合并、KV 里不存，显示合并值会让用户误以为兜底是「手填内容」，
+    // 全删保存的顾虑由此而来 —— 实际删了保存，运行时仍会自动补回兜底。
+    return json({ ok: true, config: stripFactoryOverlays(config) })
   }
 
   if (path === '/config' && method === 'PUT') {
@@ -468,7 +479,7 @@ export async function handleApi(
     // 后端才是安全边界：前端校验只负责体验，任何值都能绕过前端直接打接口
     const invalid = validateConfigPatch(body.config as Record<string, unknown>)
     if (invalid.length > 0) return error(describeFieldErrors(invalid), 400)
-    const merged = mergeConfig(config, body.config)
+    const merged = stripFactoryOverlays(mergeConfig(config, body.config))
     const mergedInvalid = validateConfigPatch(merged as unknown as Record<string, unknown>)
     if (mergedInvalid.length > 0) return error(describeFieldErrors(mergedInvalid), 400)
     await saveConfig(store, merged)
@@ -481,7 +492,8 @@ export async function handleApi(
   // 导出用**白名单**：只有显式声明的字段才会出去，新增字段默认不导出。
   // 同时返回 omitted 说明，让用户在导出那一刻就知道哪些要手工补。
   if (path === '/config/export' && method === 'GET') {
-    return json({ ok: true, ...buildConfigExport(config) })
+    // 导出的也是用户层：出厂兜底由内核动态合并，导出行只会固化成死数据
+    return json({ ok: true, ...buildConfigExport(stripFactoryOverlays(config)) })
   }
 
   // 导入分两步：先 dryRun 拿差异，用户确认后再真正写入。
