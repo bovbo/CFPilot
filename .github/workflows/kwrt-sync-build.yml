@@ -194,7 +194,7 @@ jobs:
             cat out/SHA256SUMS
             echo '```'
           } > notes.md
-          FILES=(out/cfpilot-kwrt-armv7 out/cfpilot-kwrt-armv7.gz out/cfpilot-kwrt-armv7.sha256 out/install-cfpilot-kwrt.sh out/SHA256SUMS out/VERSION)
+          FILES=(out/cfpilot-kwrt-armv7 out/cfpilot-kwrt-armv7.gz out/cfpilot-kwrt-armv7.sha256 out/install-cfpilot-kwrt.sh out/SHA256SUMS out/VERSION out/CFPilot-windows-portable.zip out/cfpilot-windows-amd64.exe out/cfpilot-desktop-SHA256SUMS out/VERSION-windows)
           TARGET=$(git rev-parse HEAD)
           gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$TAG" "${FILES[@]}" --title "Kwrt ARMv7 $VER" --notes-file notes.md --target "$TARGET"

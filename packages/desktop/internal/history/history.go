@@ -23,6 +23,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/portable"
 	"io"
 	"os"
 	"path/filepath"
@@ -167,10 +168,7 @@ func New(dir string, capN int) *Store {
 }
 
 func defaultDir() string {
-	if h, err := os.UserHomeDir(); err == nil {
-		return filepath.Join(h, ".cfpilot-gui")
-	}
-	return ".cfpilot-gui"
+	return portable.DataDir()
 }
 
 func (s *Store) path() string { return filepath.Join(s.dir, fileName) }

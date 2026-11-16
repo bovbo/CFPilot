@@ -3,6 +3,7 @@ package schedule
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/portable"
 	"os"
 	"path/filepath"
 	"sync"
@@ -71,11 +72,7 @@ func New(dir string) *Store {
 
 // DefaultDir 返回桌面版的本地数据目录（~/.cfpilot-gui）。
 func DefaultDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ".cfpilot-gui"
-	}
-	return filepath.Join(home, ".cfpilot-gui")
+	return portable.DataDir()
 }
 
 // Dir 返回存储目录。

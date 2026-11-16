@@ -44,6 +44,7 @@ import (
 	"github.com/xmwengxing/cfpilot/packages/desktop/internal/kernel"
 	"github.com/xmwengxing/cfpilot/packages/desktop/internal/logfile"
 	"github.com/xmwengxing/cfpilot/packages/desktop/internal/notify"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/portable"
 	"github.com/xmwengxing/cfpilot/packages/desktop/internal/server"
 	"github.com/xmwengxing/cfpilot/packages/desktop/internal/tray"
 	"github.com/xmwengxing/cfpilot/packages/desktop/internal/update"
@@ -51,6 +52,10 @@ import (
 
 // Version 由构建时通过 -ldflags 注入（见 scripts/build-desktop.mjs）。
 var Version = "dev"
+
+// UpdateBase 是更新来源（你自己仓库的 Releases 页），构建时用 -ldflags "-X main.UpdateBase=…" 注入；
+// 留空 = 沿用上游的更新来源。
+var UpdateBase = ""
 
 // runUpdateHelper 是「重启并更新应用」的收尾进程（--update-helper 模式）。
 //
@@ -119,6 +124,17 @@ func main() {
 		return
 	}
 
+	// ---- fork 版（你自己仓库构建）的专有设置：必须在读取任何配置之前 ----
+	//
+	// 1. 绿色便携：数据 / 升级包 / 缓存全放在 exe 同目录（data\、updates\）；
+	// 2. 只用程序内置内核（含多数据面接口），不换成上游发布的远程内核；
+	// 3. 更新从自己仓库的 Release 取，不会被「升级」成上游版本。
+	portableRes := portable.Setup()
+	kernel.DisableRemote = true
+	if strings.TrimSpace(UpdateBase) != "" {
+		update.UseFork(UpdateBase)
+	}
+
 	// 日志文件（始终写，不只在 --console 时写）
 	//
 	// 为什么始终写：界面的「日志」页签要能随时查看历史，
@@ -158,6 +174,16 @@ func main() {
 				log.Printf("[cfpilot] 打开日志文件失败：%v", werr)
 			}
 		}
+	}
+
+	if portableRes.Enabled {
+		log.Printf("[cfpilot] 绿色便携模式：数据目录 %s", portableRes.DataDir)
+		if len(portableRes.Migrated) > 0 {
+			log.Printf("[cfpilot] 已从旧位置（用户目录）复制 %d 个文件到数据目录：%s（旧文件保留未删）",
+				len(portableRes.Migrated), strings.Join(portableRes.Migrated, "、"))
+		}
+	} else if portableRes.Reason != "" {
+		log.Printf("[cfpilot] 未启用绿色便携模式：%s", portableRes.Reason)
 	}
 
 	// 配置目录必须可写，否则后面写凭据全失败 —— 启动就检查，早失败早报错

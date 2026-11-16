@@ -51,6 +51,40 @@ rm -f "$OUT/.smoke" "$OUT/.smoke.txt"
 head -c 20 "$OUT/cfpilot-kwrt-armv7" | od -An -tx1 | tr -d ' \n' | grep -q '^7f454c4601.*2800' || { echo "产物不是 ARM ELF"; exit 1; }
 echo "::endgroup::"
 
+echo "::group::构建 Windows 绿色版（桌面版，带多数据面页）"
+WINDIR_NAME="代理微内核面板"
+# 更新来源 = 本仓库的 Releases 页（由 ARMv7 的升级地址推出；本地测试没给地址就留空）
+UPBASE=""
+[ -n "$UPURL" ] && UPBASE="${UPURL%/download/*}"
+# exe 图标与版本属性：尽力而为（生成失败 / 空文件就不带图标，不影响使用）
+SYSO="cmd/cfpilot/rsrc_windows_amd64.syso"
+rm -f "$SYSO"
+if command -v go-winres >/dev/null 2>&1 && [ -f build/app.ico ]; then
+  ( cd build && go-winres simply --icon app.ico --product-name CFPilot \
+      --file-description "CFPilot 部署与维护工具（多数据面版）" --copyright "Copyright © CFPilot Contributors" \
+      --original-filename CFPilot.exe --file-version "$BASEVER" --product-version "$BASEVER" \
+      --manifest gui --out ../cmd/cfpilot/rsrc ) || echo "（图标资源生成失败，继续）"
+fi
+[ -s "$SYSO" ] || rm -f "$SYSO"
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath \
+  -ldflags "-s -w -H=windowsgui -X main.Version=${VER} -X main.UpdateBase=${UPBASE}" \
+  -o "$OUT/cfpilot-windows-amd64.exe" ./cmd/cfpilot
+rm -f "$SYSO"
+head -c 2 "$OUT/cfpilot-windows-amd64.exe" | grep -q 'MZ' || { echo "产物不是 Windows 可执行文件"; exit 1; }
+# 绿色版压缩包：解压到哪里都能直接用（数据在 data\、升级包在 updates\，程序首次运行自动创建）
+PK="$OUT/.pack/$WINDIR_NAME"
+mkdir -p "$PK"
+cp "$OUT/cfpilot-windows-amd64.exe" "$PK/CFPilot.exe"
+cp "$HERE/windows/使用说明.txt" "$PK/使用说明.txt"
+( cd "$OUT/.pack" && zip -q -r -9 "$OUT/CFPilot-windows-portable.zip" "$WINDIR_NAME" )
+rm -rf "$OUT/.pack"
+cd "$OUT"
+# 一键更新用的摘要清单与版本文件（沿用上游的强制校验流程）
+echo "$(sha256sum cfpilot-windows-amd64.exe | cut -d' ' -f1)  cfpilot-windows-amd64.exe" > cfpilot-desktop-SHA256SUMS
+echo "$VER" > VERSION-windows
+cd "$SRC"
+echo "::endgroup::"
+
 echo "::group::生成安装脚本与校验"
 python3 "$HERE/installer/build.py" "$OUT/install-cfpilot-kwrt.sh" "$UPURL"
 sh -n "$OUT/install-cfpilot-kwrt.sh"

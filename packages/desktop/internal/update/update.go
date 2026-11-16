@@ -25,6 +25,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/portable"
 	"github.com/xmwengxing/cfpilot/packages/desktop/internal/proxy"
 	"io"
 	"net/http"
@@ -127,6 +128,9 @@ func CompareVersion(a, b [3]int) int {
 //
 // 只看非 draft、非 prerelease 的发行版。
 func Check(ctx context.Context, current string) *CheckResult {
+	if ForkBase != "" {
+		return forkCheck(ctx, current)
+	}
 	res := &CheckResult{Current: current}
 
 	releases, err := fetchReleases(ctx)
@@ -463,11 +467,7 @@ func cleanup(path string) {
 
 // DefaultDownloadPath 返回新版本的落盘位置（配置目录下的 updates/）。
 func DefaultDownloadPath(version string) string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		home = "."
-	}
-	dir := filepath.Join(home, ".cfpilot-gui", "updates")
+	dir := portable.UpdateDir()
 	name := "cfpilot-" + version
 	if runtime.GOOS == "windows" {
 		name += ".exe"
