@@ -193,6 +193,31 @@ keep_on_sysupgrade() {
 }
 
 # ---------------- 数据备份 ----------------
+# ---------------- 清理垃圾 / 空间检查 ----------------
+# 路由器闪存很小：只保留必要的东西。旧版本遗留在闪存里的程序备份、残留的半成品、多余的数据备份都先清掉
+clean_junk() {
+    rm -f "$BIN_DST.new" "$LEGACY_PREV" "$LEGACY_PREV.keep" 2>/dev/null
+    rm -f /tmp/cfpilot-current.bin /tmp/cfpilot-latest.ver "$PREV_BIN.keep" 2>/dev/null
+    # 数据备份（只有 Token / 配置，几 KB）只留最新 1 份
+    ls -1t "$BACKUP_DIR"/data-*.tgz 2>/dev/null | tail -n +2 | while read -r o; do rm -f "$o"; done
+}
+
+# space_check 新程序路径：闪存够用（旧程序会被替换掉，所以可用空间 = 剩余 + 旧程序大小）
+space_check() {
+    sz=$(( $(wc -c < "$1") / 1024 ))
+    have=$(free_kb /usr/bin)
+    oldkb=0; [ -f "$BIN_DST" ] && oldkb=$(( $(wc -c < "$BIN_DST") / 1024 ))
+    if [ -n "$have" ] && [ $(( have + oldkb )) -lt $(( sz + 512 )) ] 2>/dev/null; then
+        die "空间不足：新程序约 ${sz}KB，/usr/bin 可用（含旧程序）只有 $(( have + oldkb ))KB。请先在 LuCI 软件包里卸载用不到的包，再重试。"
+    fi
+    if [ "$oldkb" -gt 0 ]; then
+        tmpfree=$(free_kb /tmp)
+        if [ -n "$tmpfree" ] && [ "$tmpfree" -lt $(( oldkb + 2048 )) ] 2>/dev/null; then
+            die "内存盘 /tmp 可用空间不足（旧版本备份需要约 ${oldkb}KB），请重启路由器后再试。"
+        fi
+    fi
+}
+
 do_backup() {
     mkdir -p "$BACKUP_DIR"
     chmod 700 "$BACKUP_DIR"
@@ -208,8 +233,8 @@ do_backup() {
     # shellcheck disable=SC2086
     tar czf "$out" -C "$DATA_DIR" $list 2>/dev/null || { say "警告：备份失败（继续）"; rm -f "$out"; return 0; }
     chmod 600 "$out"
-    # 只留最新 3 份
-    ls -1t "$BACKUP_DIR"/data-*.tgz 2>/dev/null | tail -n +4 | while read -r old; do rm -f "$old"; done
+    # 只留最新 1 份（省闪存）
+    ls -1t "$BACKUP_DIR"/data-*.tgz 2>/dev/null | tail -n +2 | while read -r old; do rm -f "$old"; done
     say "数据已备份：$out"
 }
 
@@ -217,9 +242,20 @@ do_backup() {
 # install_binary 新程序路径
 install_binary() {
     newbin="$1"
-    cp "$newbin" "$BIN_DST.new" || { say "复制失败（空间不足？df -h 看看）"; return 1; }
-    chmod 755 "$BIN_DST.new"
-    if ! trial_ok "$BIN_DST.new"; then
+    # 闪存剩余装不下「新程序 + 旧程序」时走紧张模式：旧程序先备份到内存盘再原地替换，不占闪存双份
+    tight=0
+    sz=$(( $(wc -c < "$newbin") / 1024 ))
+    have=$(free_kb /usr/bin)
+    [ -n "$have" ] && [ "$have" -lt $(( sz + 1024 )) ] 2>/dev/null && tight=1
+    if [ "$tight" = "0" ]; then
+        cp "$newbin" "$BIN_DST.new" || { rm -f "$BIN_DST.new"; say "复制失败（空间不足？df -h 看看）"; return 1; }
+        chmod 755 "$BIN_DST.new"
+        newtest="$BIN_DST.new"
+    else
+        say "闪存空间紧张：旧程序备份到内存盘后原地替换"
+        newtest="$newbin"
+    fi
+    if ! trial_ok "$newtest"; then
         rm -f "$BIN_DST.new"
         say "新程序无法在这台路由器上运行（架构不对或文件损坏），已放弃（原版本未动）。"
         return 1
@@ -235,7 +271,19 @@ install_binary() {
     fi
 
     [ -x "$INIT" ] && "$INIT" stop >/dev/null 2>&1
-    mv -f "$BIN_DST.new" "$BIN_DST"
+    if [ "$tight" = "0" ]; then
+        mv -f "$BIN_DST.new" "$BIN_DST"
+    else
+        rm -f "$BIN_DST"
+        if ! cp "$newbin" "$BIN_DST"; then
+            say "写入失败，正在恢复旧版本…"
+            rm -f "$BIN_DST"
+            [ -x "$PREV_BIN" ] && cp "$PREV_BIN" "$BIN_DST" && chmod 755 "$BIN_DST"
+            [ -x "$INIT" ] && "$INIT" start
+            return 1
+        fi
+        chmod 755 "$BIN_DST"
+    fi
     mkdir -p "$DATA_DIR"
     chmod 700 "$DATA_DIR"
     write_init
@@ -326,11 +374,8 @@ do_upgrade() {
     [ -s "$src" ] || die "升级文件为空"
     is_elf "$src" || die "$src 不是可执行程序（ELF），可能下载到了网页或文件损坏"
 
-    need=$(( $(wc -c < "$src") / 1024 * 2 + 1024 ))
-    have=$(free_kb /usr/bin)
-    if [ -n "$have" ] && [ "$have" -lt "$need" ] 2>/dev/null; then
-        die "空间不足：需要约 ${need}KB，/usr/bin 只剩 ${have}KB（df -h 看看，或清理后重试）"
-    fi
+    clean_junk
+    space_check "$src"
 
     trial_ok "$src" || die "新程序无法在这台路由器上运行，已放弃（原版本未动）"
     old=$(ver_of "$BIN_DST"); new=$(ver_of "$src")
@@ -477,11 +522,8 @@ do_install() {
     is_elf "$src" || die "$src 不是可执行程序，可能上传损坏"
     case "$(uname -m)" in armv7*|armv6*) ;; *) say "警告：这台设备架构是 $(uname -m)，本程序为 armv7l 编译，可能无法运行。" ;; esac
 
-    need=$(( $(wc -c < "$src") / 1024 * 2 + 1024 ))
-    have=$(free_kb /usr/bin)
-    if [ -n "$have" ] && [ "$have" -lt "$need" ] 2>/dev/null; then
-        die "空间不足：需要约 ${need}KB，/usr/bin 只剩 ${have}KB"
-    fi
+    clean_junk
+    space_check "$src"
 
     old=""; [ -x "$BIN_DST" ] && old=$(ver_of "$BIN_DST")
     [ -n "$old" ] && { say "检测到已安装 $old，按升级流程处理（数据保留）"; do_backup; }
