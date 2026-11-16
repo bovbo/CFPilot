@@ -148,6 +148,9 @@ func channelRemoteInfo(channel *KernelVersionManifest) *RemoteInfo {
 //     调用方按「通道没消息」继续走包 Release 通道的检查。
 //   - 通道可用但没有比内置新的内核 → info 非 nil（版本号形如 k202611141800）。
 func CheckChannelUpdate(ctx context.Context, currentVersion string) (info *RemoteInfo, hasUpdate bool) {
+	if DisableRemote {
+		return nil, false
+	}
 	channel := fetchChannelVersion(ctx)
 	if channel == nil {
 		return nil, false

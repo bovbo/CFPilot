@@ -322,6 +322,13 @@ func (s *Server) handleScanRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// 固定默认优选域名：顺带测速并记录（只作记录，结果见「数据面」页底部）。
+		// 放后台跑，不拖慢本次结果的显示；自带超时与限流，失败不影响优选。
+		if len(sum.Entries) > 0 {
+			go s.recordFixedDomains(context.Background(), host, opt.WSPath,
+				strings.TrimSpace(req.UUID), strings.TrimSpace(req.TrojanPassword))
+		}
+
 		// 转成界面期望的形态
 		entries := make([]map[string]any, 0, len(sum.Entries))
 		for _, e := range sum.Entries {

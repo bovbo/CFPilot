@@ -127,7 +127,17 @@ type RemoteInfo struct {
 //
 // 「最新」的定义：**版本号最高的、且同时带两个内核资产的发行版**。
 // 发行版列表已按版本降序排列，所以第一个满足条件的就是最新的。
+// DisableRemote = true 时完全不用上游的远程内核（热更新通道 / GitHub Release），只用程序内置内核。
+//
+// 路由器版（kwrt）在内核里加了多数据面等功能，上游发布的内核没有这些接口；
+// 如果部署时自动换成上游内核，控制面就会缺少这些接口（表现为数据面页 HTTP 401）。
+// 内核的更新由「同步上游 → 合并 → 重新构建」带进内置内核，不需要远程通道。
+var DisableRemote bool
+
 func FetchRemoteInfo(ctx context.Context) (*RemoteInfo, error) {
+	if DisableRemote {
+		return nil, nil
+	}
 	releases, err := update.FetchReleases(ctx)
 	if err != nil {
 		return nil, err
@@ -371,6 +381,11 @@ func verifyAsset(assetName string, content []byte, sums map[string]string) error
 //   - 内嵌内核也拿不到 → err 非空且 artifacts 为 nil
 func LoadPreferred(ctx context.Context, currentVersion string) (*Artifacts, *RemoteInfo, error) {
 	current := strings.TrimSpace(currentVersion)
+
+	if DisableRemote {
+		a, err := loadLocal(current)
+		return a, nil, err
+	}
 
 	// ---- 0. 内核热更新通道（固定滚动 tag，与包版本解耦）----
 	//

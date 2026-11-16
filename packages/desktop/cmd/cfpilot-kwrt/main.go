@@ -34,6 +34,7 @@ import (
 	"syscall"
 
 	"github.com/xmwengxing/cfpilot/packages/desktop/internal/config"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/kernel"
 	"github.com/xmwengxing/cfpilot/packages/desktop/internal/logfile"
 	"github.com/xmwengxing/cfpilot/packages/desktop/internal/scan"
 	"github.com/xmwengxing/cfpilot/packages/desktop/internal/server"
@@ -43,6 +44,8 @@ import (
 var Version = "dev"
 
 func main() {
+	// 只用内置内核（含多数据面接口），不换成上游发布的远程内核
+	kernel.DisableRemote = true
 	var (
 		portFlag    = flag.Int("port", 0, "监听端口（覆盖配置，仅本次生效）")
 		dataDir     = flag.String("data-dir", "", "数据目录（凭据 / 配置 / 日志）")
