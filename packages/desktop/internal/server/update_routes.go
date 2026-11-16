@@ -48,6 +48,16 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 路由器版不走上游「桌面版」更新（那是 Windows/macOS 安装包，路由器用不上，还会白占闪存），
+	// 统一用 cfpilot-ctl 的一键更新（/api/kwrt/update/*）。
+	if kwrtSupported() {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"current": Version(), "latest": "", "hasUpdate": false, "downloadUrl": "", "notes": "",
+			"error": "路由器版请使用「一键更新」卡片更新",
+		})
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
 	defer cancel()
 
@@ -75,6 +85,11 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleUpdateDownload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "仅支持 POST"})
+		return
+	}
+
+	if kwrtSupported() {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "路由器版请使用「一键更新」卡片更新"})
 		return
 	}
 
@@ -164,6 +179,11 @@ func (s *Server) handleUpdateDownload(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "仅支持 POST"})
+		return
+	}
+
+	if kwrtSupported() {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "路由器版请使用「一键更新」卡片更新"})
 		return
 	}
 

@@ -47,3 +47,23 @@ esac`)
 		t.Fatal(w.Body.String())
 	}
 }
+
+func TestKwrtBlocksDesktopUpdate(t *testing.T) {
+	fakeCtl(t, "exit 0\n")
+	s := &Server{}
+	w := httptest.NewRecorder()
+	s.handleUpdateCheck(w, httptest.NewRequest("POST", "/api/update/check", nil))
+	if !strings.Contains(w.Body.String(), `"hasUpdate":false`) || !strings.Contains(w.Body.String(), "一键更新") {
+		t.Fatal(w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	s.handleUpdateDownload(w, httptest.NewRequest("POST", "/api/update/download", strings.NewReader(`{"url":"https://x"}`)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	s.handleUpdateApply(w, httptest.NewRequest("POST", "/api/update/apply", strings.NewReader(`{"file":"x"}`)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatal(w.Code, w.Body.String())
+	}
+}

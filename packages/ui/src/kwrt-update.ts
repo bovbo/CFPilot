@@ -37,6 +37,9 @@ export function bindKwrtUpdate(deps: KwrtUpdateDeps): void {
       const r = await api.kwrtUpdateCheck()
       if (!r.supported) return
       card!.hidden = false
+      // 路由器版只用这张卡片更新：把上游「桌面版」的检查更新卡片藏起来，避免混淆
+      const desk = document.getElementById('updateBadge')?.closest('.card') as HTMLElement | null
+      if (desk) desk.hidden = true
       ver.textContent = `当前版本：${r.current || '—'}　最新版本：${r.latest || '—'}`
       if (r.error) {
         setBadge('检查失败', 'err')
