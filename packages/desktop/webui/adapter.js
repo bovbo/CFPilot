@@ -798,6 +798,10 @@
     dpPush: function (ids, mode, lines) {
       return post('/api/dp/push', { ids: ids || [], mode: mode || '', lines: lines || [] })
     },
+    /** 立即对 9 个固定优选域名测速（后台进行，结果刷新到表格） */
+    dpFixedTest: function () {
+      return post('/api/dp/fixed/test', {})
+    },
     /** 只从某一个数据面的池里删除指定 IP */
     dpRemoveIps: function (id, ips) {
       return post('/api/dp/ips/remove', { id: id, ips: ips || [] })

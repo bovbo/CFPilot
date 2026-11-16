@@ -32,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/xmwengxing/cfpilot/packages/desktop/internal/config"
 	"github.com/xmwengxing/cfpilot/packages/desktop/internal/kernel"
@@ -160,6 +161,20 @@ func main() {
 		} else {
 			log.Printf("[cfpilot] 管理地址（含一次性令牌）已写入 %s", *urlFile)
 		}
+	}
+
+	// 地址文件在 /tmp（内存盘），可能被清理；每 20 秒检查一次，缺了或局域网地址变了就补写，
+	// 这样 LuCI 页面不会再出现“管理地址还没生成”。
+	if *urlFile != "" {
+		go func() {
+			for {
+				time.Sleep(20 * time.Second)
+				u := lanURL(srv, settings) + "\n"
+				if old, err := os.ReadFile(*urlFile); err != nil || string(old) != u {
+					_ = os.WriteFile(*urlFile, []byte(u), 0o600)
+				}
+			}
+		}()
 	}
 
 	ch := make(chan os.Signal, 1)

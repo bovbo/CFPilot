@@ -149,6 +149,13 @@ return view.extend({
 					E('button', { 'id': 'cfpilot-upd-btn', 'class': 'cbi-button cbi-button-apply',
 						'click': ui.createHandlerFn(self, function () { return self.applyUpdate(); }) }, '一键更新')
 				]),
+				E('div', { 'style': 'margin-top:10px' }, [
+					E('div', { 'style': 'opacity:.8;margin-bottom:4px' }, 'GitHub 加速前缀（路由器连不上 GitHub 时填，以 https:// 开头；留空保存 = 清除）：'),
+					E('input', { 'id': 'cfpilot-gh-proxy', 'type': 'text', 'class': 'cbi-input-text', 'style': 'width:60%;margin-right:8px',
+						'placeholder': 'https://你的加速地址/' }),
+					E('button', { 'class': 'cbi-button cbi-button-save',
+						'click': ui.createHandlerFn(self, function () { return self.saveProxy(); }) }, '保存加速前缀')
+				]),
 				E('pre', { 'id': 'cfpilot-upd-log', 'style': 'max-height:200px;overflow:auto;white-space:pre-wrap;font-size:12px;margin-top:8px;display:' + (self.updLog ? 'block' : 'none') }, self.updLog),
 				E('div', { 'style': 'margin-top:10px;font-size:13px' }, [
 					E('div', { 'style': 'opacity:.8;margin-bottom:4px' }, 'SSH 命令说明（在路由器终端里执行）：'),
@@ -157,6 +164,7 @@ return view.extend({
 						['cfpilot-ctl upgrade', '一键更新：下载最新版 → 校验 → 试运行 → 替换并重启，失败自动回退'],
 						['cfpilot-ctl rollback', '回退到更新前的旧版本（旧版本放在内存里，路由器重启后就没有了）'],
 						['cfpilot-ctl autoupdate on', '开启每周自动更新（off 关闭）'],
+						['cfpilot-ctl proxy 前缀/', '设置 GitHub 加速前缀（proxy off 清除，只写 proxy 查看当前值）'],
 						['cfpilot-ctl backup', '备份 Token 与配置（只保留最新 1 份，很小）'],
 						['cfpilot-ctl status', '查看运行状态'],
 						['cfpilot-ctl uninstall', '卸载程序（数据目录保留，确定不要了再手动删除）']
@@ -200,6 +208,16 @@ return view.extend({
 				else self.setUpd('已是最新版本：' + j.current);
 			} catch (e) { self.setUpd('检查失败：' + out); }
 		}).catch(function (e) { self.setUpd('检查失败：' + e.message); });
+	},
+
+	saveProxy: function () {
+		var self = this;
+		var inp = document.getElementById('cfpilot-gh-proxy');
+		var v = inp ? inp.value.replace(/\s+/g, '') : '';
+		return fs.exec('/usr/bin/cfpilot-ctl', ['proxy', v === '' ? 'off' : v]).then(function (r) {
+			var msg = String(r.stdout || '').trim() || String(r.stderr || '').trim();
+			self.setUpd(msg + '。现在可以点「检查更新」重试。');
+		}).catch(function (e) { self.setUpd('保存失败：' + e.message); });
 	},
 
 	applyUpdate: function () {

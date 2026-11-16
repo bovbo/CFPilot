@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xmwengxing/cfpilot/packages/desktop/internal/deploy"
@@ -33,6 +34,69 @@ func (s *Server) registerDPRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/dp/ips/remove", s.guard(s.handleDPRemoveIPs))
 	mux.HandleFunc("/api/dp/settings", s.guard(s.handleDPSettings))
 	mux.HandleFunc("/api/dp/deploy", s.guard(s.handleDPDeploy))
+	mux.HandleFunc("/api/dp/fixed/test", s.guard(s.handleDPFixedTest))
+}
+
+var dpFixedTesting struct {
+	sync.Mutex
+	on bool
+}
+
+// handleDPFixedTest 立即对 9 个固定优选域名解析 + 测速，结果写入表格（后台进行，界面轮询）。
+func (s *Server) handleDPFixedTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "仅支持 POST"})
+		return
+	}
+	profile, err := s.store.Active()
+	if err != nil || profile == nil || strings.TrimSpace(profile.CfToken) == "" ||
+		strings.TrimSpace(profile.AccountID) == "" || strings.TrimSpace(profile.KVNamespaceID) == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "当前账号缺少 API Token / KV，请先在「凭据」页完成并选择 KV"})
+		return
+	}
+	rctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+	raw, ok := s.newCFClient(profile.CfToken).GetKVValue(rctx, profile.AccountID, profile.KVNamespaceID, deploy.ManifestKey)
+	cancel()
+	if !ok || strings.TrimSpace(raw) == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "读取部署清单失败（网络不通或还没部署）。请先确认能打开 Cloudflare，再试"})
+		return
+	}
+	var m deploy.Manifest
+	if json.Unmarshal([]byte(raw), &m) != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "部署清单格式损坏"})
+		return
+	}
+	host := m.DataCustomDomain
+	if host == "" {
+		host = normalizePagesHost(m.DataSubdomain)
+	}
+	if host == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "清单里没有数据面域名，请先完成一次部署"})
+		return
+	}
+	wsPath := strings.TrimSpace(m.Credentials.WSPath)
+	if wsPath == "" {
+		wsPath = scan.ProbeDefaultPath
+	}
+	dpFixedTesting.Lock()
+	if dpFixedTesting.on {
+		dpFixedTesting.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "固定域名正在测速中，请稍等"})
+		return
+	}
+	dpFixedTesting.on = true
+	dpFixedTesting.Unlock()
+	go func() {
+		defer func() {
+			dpFixedTesting.Lock()
+			dpFixedTesting.on = false
+			dpFixedTesting.Unlock()
+		}()
+		s.logf("固定优选域名：开始手动测速（数据面 " + host + "）")
+		s.recordFixedDomains(context.Background(), host, wsPath, m.Credentials.UUID, m.Credentials.TrojanPassword)
+		s.logf("固定优选域名：测速完成，结果见「数据面」页表格")
+	}()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
 
 func dpDecode(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -91,7 +155,7 @@ func (s *Server) handleDPList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "planes": st.List(), "settings": st.Settings(), "profiles": profiles,
 		"pools": pools, "poolError": poolErr, "pushing": pushing,
-		"fixedDomains": st.FixedRecords(),
+		"fixedDomains": st.FixedRecords(), "fixedTesting": func() bool { dpFixedTesting.Lock(); defer dpFixedTesting.Unlock(); return dpFixedTesting.on }(),
 	})
 }
 

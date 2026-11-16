@@ -82,6 +82,8 @@ export function bindDpPage(deps: DpPageDeps): () => void {
     renderFixed()
     el('dpBadge').textContent = data.planes.length + ' 个数据面'
     el('dpPushState').textContent = data.pushing ? '正在推送…' : ''
+    el('dpFixedState').textContent = data.fixedTesting ? '测速中，约 1～3 分钟，结果会自动刷新…' : ''
+    el<HTMLButtonElement>('btnDpFixedTest').disabled = !!data.fixedTesting
   }
 
   function renderSettings(): void {
@@ -287,6 +289,29 @@ export function bindDpPage(deps: DpPageDeps): () => void {
     }, 3000)
   }
 
+  async function fixedTest(): Promise<void> {
+    const r = await window.cfpilot.dpFixedTest()
+    if (!r || !r.ok) {
+      log('固定域名测速未开始：' + ((r && r.error) || '未知错误'), 'warn')
+      window.alert('固定域名测速未开始：' + ((r && r.error) || '未知错误'))
+      return
+    }
+    log('固定域名测速已开始，结果稍后显示在表格里', 'info')
+    el<HTMLButtonElement>('btnDpFixedTest').disabled = true
+    el('dpFixedState').textContent = '测速中，约 1～3 分钟，结果会自动刷新…'
+    if (pollTimer !== null) window.clearInterval(pollTimer)
+    let n = 0
+    pollTimer = window.setInterval(() => {
+      n++
+      void load(false).then(() => {
+        if ((data && !data.fixedTesting) || n >= 70) {
+          if (pollTimer !== null) window.clearInterval(pollTimer)
+          pollTimer = null
+        }
+      })
+    }, 3000)
+  }
+
   async function push(ids: string[], mode: string): Promise<void> {
     if (mode === 'replace') {
       const names = ids.length ? ids.map((i) => (planeById(i)?.name || i)).join('、') : '全部启用的数据面'
@@ -416,6 +441,7 @@ export function bindDpPage(deps: DpPageDeps): () => void {
   on('btnDpDeployAll', () => deploy([]))
   on('btnDpSettingsSave', saveSettings)
   on('btnDpRemoveIps', removeIps)
+  on('btnDpFixedTest', fixedTest)
   el('dpBody')?.addEventListener('click', (e) => { void onTableClick(e) })
   el('dpLogPick')?.addEventListener('change', renderLog)
   // 定时 / 优选完成后的自动推送结束时，后端会发 dp-push 事件：已打开过本页就静默刷新

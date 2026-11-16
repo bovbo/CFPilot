@@ -418,6 +418,7 @@ interface Window {
     dpSave(plane: DpSaveRequest): Promise<{ ok: boolean; plane?: DpPlaneView; warning?: string; pushStarted?: boolean; error?: string }>
     dpDelete(id: string): Promise<{ ok: boolean; warning?: string; error?: string }>
     dpSyncDeploy(id: string): Promise<{ ok: boolean; plane?: DpPlaneView; warning?: string; error?: string }>
+    dpFixedTest(): Promise<{ ok: boolean; started?: boolean; error?: string }>
     dpPush(ids?: string[], mode?: string, lines?: string[]): Promise<{ ok: boolean; started?: boolean; mode?: string; count?: number; error?: string }>
     dpRemoveIps(id: string, ips: string[]): Promise<{ ok: boolean; result?: DpPushRecordView; error?: string }>
     dpSettings(settings: DpSettingsView): Promise<{ ok: boolean; settings?: DpSettingsView; error?: string }>
@@ -1452,5 +1453,6 @@ interface DpListResult {
   poolError: string
   pushing: boolean
   fixedDomains: DpFixedRecordView[]
+  fixedTesting?: boolean
   error?: string
 }

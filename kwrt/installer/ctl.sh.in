@@ -6,6 +6,7 @@
 #   2. sh /tmp/install-cfpilot-kwrt.sh
 # 装好后，本脚本会复制成命令 cfpilot-ctl，以后直接用：
 #   cfpilot-ctl status            运行状态 + 内存 + 连接表
+#   cfpilot-ctl proxy [前缀|off]  设置/清除 GitHub 加速前缀（路由器连不上 GitHub 时用）
 #   cfpilot-ctl url               查看管理地址
 #   cfpilot-ctl mem               资源监控采样（最近 20 行）
 #   cfpilot-ctl logs [行数]       程序日志
@@ -105,11 +106,9 @@ fetch() {
     rm -f "$dest"
     if command -v uclient-fetch >/dev/null 2>&1; then
         uclient-fetch -q -T "${FETCH_T:-60}" -O "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
-        [ -n "$FETCH_QUICK" ] && { rm -f "$dest"; return 1; }
     fi
     if command -v wget >/dev/null 2>&1; then
         wget -q -T "${FETCH_T:-60}" -O "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
-        [ -n "$FETCH_QUICK" ] && { rm -f "$dest"; return 1; }
     fi
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL --max-time "${FETCH_T:-120}" -o "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
@@ -409,10 +408,14 @@ do_check() {
     case "$UPGRADE_URL" in
         http://*|https://*)
             # 只是查个版本号：每个工具最多等 12 秒、只试一个，避免网络不通时卡很久（LuCI/网页会超时）
-            if FETCH_QUICK=1 FETCH_T=12 fetch "${UPGRADE_URL%/*}/VERSION" /tmp/cfpilot-latest.ver; then
+            if FETCH_QUICK=1 FETCH_T=15 fetch "${UPGRADE_URL%/*}/VERSION" /tmp/cfpilot-latest.ver; then
                 latest=$(head -n1 /tmp/cfpilot-latest.ver | tr -d '\r\n "')
             else
-                err="获取最新版本失败（网络不通？可在 $UP_CONF 填 GH_PROXY）"
+                if [ -n "$GH_PROXY" ]; then
+                    err="获取最新版本失败：已设置加速前缀但仍连不上，请换一个加速地址（SSH 执行 cfpilot-ctl proxy 新前缀/）"
+                else
+                    err="路由器连不上 GitHub（国内常见）。请在下面「GitHub 加速前缀」填一个能用的加速地址后再检查"
+                fi
             fi
             rm -f /tmp/cfpilot-latest.ver
             ;;
@@ -567,9 +570,23 @@ check) do_check "$2" ;;
 rollback) do_rollback ;;
 backup) do_backup ;;
 autoupdate) do_autoupdate "$2" ;;
+proxy)
+    # cfpilot-ctl proxy            显示当前加速前缀
+    # cfpilot-ctl proxy 前缀/      设置（必须 https:// 开头）
+    # cfpilot-ctl proxy off        清除
+    [ -f "$UP_CONF" ] || write_upgrade_conf
+    case "$2" in
+    "") . "$UP_CONF"; echo "${GH_PROXY:-（未设置）}" ;;
+    off) sed -i 's|^GH_PROXY=.*|GH_PROXY=""|' "$UP_CONF"; say "已清除加速前缀" ;;
+    https://*)
+        p="$2"; case "$p" in */) ;; *) p="$p/" ;; esac
+        case "$p" in *[\"\\\&\|\ ]*) die "前缀里不能有空格、引号、& | 等特殊字符" ;; esac
+        sed -i "s|^GH_PROXY=.*|GH_PROXY=\"$p\"|" "$UP_CONF"; say "已设置加速前缀：$p" ;;
+    *) die "前缀必须以 https:// 开头，例如 https://你的加速地址/" ;;
+    esac ;;
 luci) install_luci ;;
 uninstall) do_uninstall ;;
-help|-h|--help) sed -n '2,28p' "$0" ;;
+help|-h|--help) sed -n '2,30p' "$0" ;;
 ""|install) do_install "$2" ;;
 *)
     # 兼容：直接给一个文件路径 = 安装 / 升级
