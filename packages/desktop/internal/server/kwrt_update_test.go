@@ -33,7 +33,7 @@ func TestKwrtUnsupported(t *testing.T) {
 
 func TestKwrtCheckAndStatus(t *testing.T) {
 	fakeCtl(t, `case "$1" in
-check) echo "检查中"; echo '{"current":"0.43.0+aaa","latest":"0.43.0+bbb","update":true,"error":""}';;
+check) [ "$2" = "--json" ] || exit 1; echo "检查中"; echo '{"current":"0.43.0+aaa","latest":"0.43.0+bbb","update":true,"error":""}';;
 upgrade-status) echo "ok 123"; echo "line1";;
 esac`)
 	w := httptest.NewRecorder()

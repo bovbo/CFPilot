@@ -80,7 +80,7 @@ func (s *Server) handleDPList(w http.ResponseWriter, r *http.Request) {
 		} else if tok := scan.FetchScannerToken(ctx, host, pw, 20*time.Second); !tok.OK {
 			poolErr = tok.Error
 		} else if m, err := scan.PoolCounts(ctx, host, tok.Token, 15*time.Second); err != nil {
-			poolErr = err.Error()
+			poolErr = dpOldControlHint(err.Error())
 		} else {
 			pools = m
 		}

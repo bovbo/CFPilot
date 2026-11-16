@@ -173,7 +173,7 @@ func (s *Server) dpSyncRegistry(ctx context.Context) error {
 	}
 	res := scan.PutRegistry(ctx, host, tok.Token, dpRegistryItems(s.dpStore().List()), 20*time.Second)
 	if !res.OK {
-		return fmt.Errorf("同步数据面注册表失败：%s", res.Error)
+		return fmt.Errorf("同步数据面注册表失败：%s", dpOldControlHint(res.Error))
 	}
 	return nil
 }
@@ -359,7 +359,7 @@ func (s *Server) dpPushAll(ctx context.Context, ids []string, lines []string, mo
 	}
 	// 先同步注册表：内核只接受已注册的数据面
 	if reg := scan.PutRegistry(ctx, host, tok.Token, dpRegistryItems(s.dpStore().List()), 20*time.Second); !reg.OK {
-		return fail("同步数据面注册表失败：" + reg.Error)
+		return fail("同步数据面注册表失败：" + dpOldControlHint(reg.Error))
 	}
 
 	results := make([]dpPushResult, 0, len(targets))
@@ -415,4 +415,15 @@ func (s *Server) dpSourceLines(n int) []string {
 		pool = pool[:n]
 	}
 	return schedule.CopyLines(pool)
+}
+
+// dpOldControlHint 给「控制面是旧版内核」这类最常见的 401 / 404 加上一句人话说明。
+//
+// 多数据面接口（/api/scanner/dataplanes 等）是新版内核才有的；线上还是旧版控制面时，
+// 请求会落到普通会话鉴权上，返回「未登录或会话已过期」的 401，容易被误以为是密码错了。
+func dpOldControlHint(msg string) string {
+	if strings.Contains(msg, "HTTP 401") || strings.Contains(msg, "HTTP 404") || strings.Contains(msg, "HTTP 405") {
+		return msg + "\n   → 很可能是控制面还是旧版内核（不支持多数据面接口）。请到「部署」页重新部署一次控制面，把内核升级到当前程序自带的新版本，再重试。"
+	}
+	return msg
 }

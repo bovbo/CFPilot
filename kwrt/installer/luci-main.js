@@ -142,15 +142,31 @@ return view.extend({
 
 			E('div', { 'class': 'cbi-section' }, [
 				E('h3', {}, '更新（来自 GitHub Releases）'),
-				E('p', { 'id': 'cfpilot-upd-info', 'style': 'opacity:.85' }, '点「检查更新」查看是否有新版本；一键更新会下载、校验、自检后替换并自动重启，失败自动回退，数据不受影响。'),
+				E('p', { 'id': 'cfpilot-upd-info', 'style': 'opacity:.85' }, self.updText),
 				E('div', {}, [
 					E('button', { 'class': 'cbi-button cbi-button-action', 'style': 'margin-right:8px',
 						'click': ui.createHandlerFn(self, function () { return self.checkUpdate(); }) }, '检查更新'),
 					E('button', { 'id': 'cfpilot-upd-btn', 'class': 'cbi-button cbi-button-apply',
 						'click': ui.createHandlerFn(self, function () { return self.applyUpdate(); }) }, '一键更新')
 				]),
-				E('pre', { 'id': 'cfpilot-upd-log', 'style': 'max-height:200px;overflow:auto;white-space:pre-wrap;font-size:12px;margin-top:8px;display:none' }, ''),
-				E('p', { 'style': 'opacity:.6;font-size:12px' }, 'SSH 命令：cfpilot-ctl check / cfpilot-ctl upgrade / cfpilot-ctl rollback / cfpilot-ctl autoupdate on')
+				E('pre', { 'id': 'cfpilot-upd-log', 'style': 'max-height:200px;overflow:auto;white-space:pre-wrap;font-size:12px;margin-top:8px;display:' + (self.updLog ? 'block' : 'none') }, self.updLog),
+				E('div', { 'style': 'margin-top:10px;font-size:13px' }, [
+					E('div', { 'style': 'opacity:.8;margin-bottom:4px' }, 'SSH 命令说明（在路由器终端里执行）：'),
+					E('table', { 'class': 'table' }, [
+						['cfpilot-ctl check', '检查有没有新版本（只查询，不改动）'],
+						['cfpilot-ctl upgrade', '一键更新：下载最新版 → 校验 → 试运行 → 替换并重启，失败自动回退'],
+						['cfpilot-ctl rollback', '回退到更新前的旧版本（旧版本放在内存里，路由器重启后就没有了）'],
+						['cfpilot-ctl autoupdate on', '开启每周自动更新（off 关闭）'],
+						['cfpilot-ctl backup', '备份 Token 与配置（只保留最新 1 份，很小）'],
+						['cfpilot-ctl status', '查看运行状态'],
+						['cfpilot-ctl uninstall', '卸载程序（数据目录保留，确定不要了再手动删除）']
+					].map(function (r) {
+						return E('tr', { 'class': 'tr' }, [
+							E('td', { 'class': 'td left', 'style': 'white-space:nowrap;font-family:monospace', 'width': '35%' }, r[0]),
+							E('td', { 'class': 'td left' }, r[1])
+						]);
+					}))
+				])
 			]),
 
 			E('div', { 'class': 'cbi-section' }, [
@@ -160,7 +176,12 @@ return view.extend({
 		]);
 	},
 
+	updText: '点「检查更新」查看是否有新版本；一键更新会下载、校验、自检后替换并自动重启，失败自动回退，数据不受影响。',
+	updLog: '',
+
 	setUpd: function (text, log) {
+		if (text !== null) this.updText = text;
+		if (log) this.updLog = log;
 		var i = document.getElementById('cfpilot-upd-info');
 		if (i && text !== null) i.textContent = text;
 		var l = document.getElementById('cfpilot-upd-log');
@@ -170,7 +191,7 @@ return view.extend({
 	checkUpdate: function () {
 		var self = this;
 		self.setUpd('正在检查更新…');
-		return fs.exec('/usr/bin/cfpilot-ctl', ['check']).then(function (r) {
+		return fs.exec('/usr/bin/cfpilot-ctl', ['check', '--json']).then(function (r) {
 			var out = String(r.stdout || '').trim().split('\n').pop();
 			try {
 				var j = JSON.parse(out);

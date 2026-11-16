@@ -182,9 +182,9 @@ export function bindDpPage(deps: DpPageDeps): () => void {
     const list = data.fixedDomains || []
     const table = el('dpFixedTable')
     const empty = el('dpFixedEmpty')
-    const tested = list.some((r) => r.at)
-    table.hidden = !tested
-    empty.hidden = tested
+    // 9 个固定域名一直列出来（没测速前显示“尚未测速”），不再藏到第一次优选之后
+    table.hidden = list.length === 0
+    empty.hidden = list.length > 0
     el('dpFixedBody').innerHTML = list.map((r) =>
       '<tr><td>' + escapeHtml(r.domain) + '</td>' +
       '<td>' + (r.at ? (r.ok ? '<span class="badge ok">可用</span>' : '<span class="badge info">未通过</span>') : '—') + '</td>' +

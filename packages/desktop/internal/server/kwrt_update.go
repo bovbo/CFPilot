@@ -50,7 +50,7 @@ func (s *Server) handleKwrtCheck(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"supported": false})
 		return
 	}
-	out, err := kwrtRun(40*time.Second, "check")
+	out, err := kwrtRun(40*time.Second, "check", "--json")
 	// cfpilot-ctl check 最后一行是 JSON
 	line := out
 	if i := strings.LastIndex(out, "\n"); i >= 0 {

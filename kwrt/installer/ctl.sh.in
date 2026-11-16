@@ -104,13 +104,15 @@ fetch() {
     esac
     rm -f "$dest"
     if command -v uclient-fetch >/dev/null 2>&1; then
-        uclient-fetch -q -T 60 -O "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+        uclient-fetch -q -T "${FETCH_T:-60}" -O "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+        [ -n "$FETCH_QUICK" ] && { rm -f "$dest"; return 1; }
     fi
     if command -v wget >/dev/null 2>&1; then
-        wget -q -T 60 -O "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+        wget -q -T "${FETCH_T:-60}" -O "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+        [ -n "$FETCH_QUICK" ] && { rm -f "$dest"; return 1; }
     fi
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --max-time 120 -o "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+        curl -fsSL --max-time "${FETCH_T:-120}" -o "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
     fi
     rm -f "$dest"
     return 1
@@ -406,7 +408,8 @@ do_check() {
     [ -f "$UP_CONF" ] && . "$UP_CONF"
     case "$UPGRADE_URL" in
         http://*|https://*)
-            if fetch "${UPGRADE_URL%/*}/VERSION" /tmp/cfpilot-latest.ver; then
+            # 只是查个版本号：每个工具最多等 12 秒、只试一个，避免网络不通时卡很久（LuCI/网页会超时）
+            if FETCH_QUICK=1 FETCH_T=12 fetch "${UPGRADE_URL%/*}/VERSION" /tmp/cfpilot-latest.ver; then
                 latest=$(head -n1 /tmp/cfpilot-latest.ver | tr -d '\r\n "')
             else
                 err="获取最新版本失败（网络不通？可在 $UP_CONF 填 GH_PROXY）"
