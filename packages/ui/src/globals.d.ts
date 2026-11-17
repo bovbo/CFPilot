@@ -303,6 +303,7 @@ interface Window {
       speedUrl?: string
       speedConnections?: number
       speedDurationMs?: number
+      minSpeedMBps?: number
       /**
        * 为 true 表示「只输出列表，不回填面板」。
        *
