@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/netfix"
 	"io"
 	"mime/multipart"
 	"net"
@@ -129,10 +130,8 @@ func New(opts Options) *Client {
 	// 针对「连续多次请求同一域名」优化的 Transport
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		// 本机 DNS 被污染时（解析到别人的服务器）改用 DoH 解析 api.cloudflare.com，证书仍按域名校验
+		DialContext: netfix.DialContext,
 		// 每个 host 保留更多空闲连接：部署过程会连续打几十个请求，
 		// 默认值 2 会导致频繁重建连接（也是 EOF 的来源之一）
 		MaxIdleConns:        100,

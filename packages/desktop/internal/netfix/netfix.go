@@ -5,7 +5,7 @@
 //	x509: certificate is valid for *.intel.com, not jooj-b1x.pages.dev   ← 域名被解析到了别人的服务器
 //	TLS handshake timeout / EOF                                          ← 解析到了不通的地址
 //
-// 做法：对 *.pages.dev / *.workers.dev 这类 Cloudflare 托管域名，不信任系统 DNS，
+// 做法：对 *.pages.dev / *.workers.dev / api.cloudflare.com 这类 Cloudflare 托管域名，不信任系统 DNS，
 // 改用 DoH（HTTPS 上的 DNS，直连 1.1.1.1 / 8.8.8.8 的 IP）解析，再按 IP 拨号。
 // TLS 仍然校验原域名的证书，所以不降低安全性；DoH 全部失败时退回系统 DNS。
 package netfix
@@ -25,6 +25,9 @@ import (
 )
 
 var suffixes = []string{".pages.dev", ".workers.dev"}
+
+// 精确匹配的主机（Cloudflare API）。
+var exactHosts = map[string]bool{"api.cloudflare.com": true}
 
 // DoH 服务（用 IP 直连，避免先解析 DoH 域名）。
 var dohServers = []string{
@@ -55,6 +58,9 @@ func matches(host string) bool {
 	h := strings.ToLower(strings.TrimSuffix(host, "."))
 	if net.ParseIP(h) != nil {
 		return false
+	}
+	if exactHosts[h] {
+		return true
 	}
 	for _, s := range suffixes {
 		if strings.HasSuffix(h, s) {
