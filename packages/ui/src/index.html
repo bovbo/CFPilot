@@ -1796,6 +1796,12 @@
               </div>
               <div class="pair">
                 <div class="field">
+                  <label title="稳态下行速度低于该值的 IP 直接淘汰，不会出现在结果里，也就不会进优选池。&#10;0 = 不过滤。1 MB/s = 8 Mb/s。选了「测速：关」时此项无效。">最低下行速度（Mb/s）</label>
+                  <input type="number" id="optMinSpeedMbps" min="0" max="8000" step="1" value="0" />
+                </div>
+              </div>
+              <div class="pair">
+                <div class="field">
                   <label title="短测粗筛 + 精确测速（默认）：先对全部通过候选做 1.2s×2 短测粗排，再对前 30 个做 6s×8 精测，避免快 IP 被截掉。&#10;仅精确测速：按 TLS/延迟取前 30 个直接精测。&#10;关：跳过测速，只按延迟排序。">测速</label>
                   <select id="optSpeedMode">
                     <option value="two" selected>短测粗筛 + 精确测速</option>
@@ -2108,7 +2114,7 @@
                     <th>IP</th>
                     <th>端口</th>
                     <th>来源任务</th>
-                    <th>下行(MB/s)</th>
+                    <th>下行(Mb/s)</th>
                     <th>延迟(ms)</th>
                     <th>机房</th>
                     <th>入池时间</th>
@@ -2146,7 +2152,7 @@
             <!-- 回填进度 / 结果反馈 -->
             <p class="tip" id="pushHint" style="margin-top: 8px"></p>
             <table id="scanTable" hidden>
-              <thead><tr><th>#</th><th>地址</th><th>机房</th><th>TLS握手(ms)</th><th>TCP(ms)</th><th>下行(MB/s)</th><th>质量检测</th></tr></thead>
+              <thead><tr><th>#</th><th>地址</th><th>机房</th><th>TLS握手(ms)</th><th>TCP(ms)</th><th>下行(Mb/s)</th><th>质量检测</th></tr></thead>
               <tbody></tbody>
             </table>
           </div>
@@ -2833,9 +2839,9 @@
                     <p class="tip">本机时间 00:00 - 23:59。</p>
                   </div>
                   <div class="field">
-                    <label>速度过滤（下行 MB/s）</label>
+                    <label>速度过滤（下行 Mb/s）</label>
                     <input type="number" id="taskMinSpeed" min="0" max="1000" step="0.1" value="0" />
-                    <p class="tip">0 = 不过滤；低于该值的候选淘汰。</p>
+                    <p class="tip">0 = 不过滤；低于该值的候选淘汰（1 MB/s = 8 Mb/s）。</p>
                   </div>
                 </div>
                 <div class="field" style="margin-top:12px">
