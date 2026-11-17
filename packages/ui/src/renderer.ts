@@ -2096,7 +2096,7 @@ import { bindKwrtUpdate } from './kwrt-update'
     sorted.forEach((e, i) => {
       const tr = document.createElement('tr')
       // 跳过测速时速度本就是 0，显示 — 而不是 0，避免误解成「测出来是 0」
-      const speed = payload.skippedSpeed ? '—' : (e.speed * 8).toFixed(2)
+      const speed = payload.skippedSpeed ? '—' : String(e.speed)
       // TLS 握手耗时是「导入后会不会 -1」的关键指标，放在最前面
       const tls = e.tlsMs > 0 ? String(e.tlsMs) : '—'
       // 机房列显示「SIN新加坡」——与可复制结果的备注一致
@@ -2171,7 +2171,7 @@ import { bindKwrtUpdate } from './kwrt-update'
     table.hidden = payload.entries.length === 0
     // 表头也标明速度列是否有效
     const speedHead = table.querySelectorAll('th')[5]
-    if (speedHead) speedHead.textContent = payload.skippedSpeed ? '下行(已跳过)' : '下行(Mb/s)'
+    if (speedHead) speedHead.textContent = payload.skippedSpeed ? '下行(已跳过)' : '下行(MB/s)'
 
     //
     // 回填改为结果出来后手动触发，所以这里要把可复制格式保存下来，
@@ -3188,7 +3188,7 @@ import { bindKwrtUpdate } from './kwrt-update'
         first.description || ''
       ;($('taskInterval') as HTMLInputElement).value = String(first.intervalDays)
       ;($('taskRunAt') as HTMLInputElement).value = first.runAt
-      ;($('taskMinSpeed') as HTMLInputElement).value = String(+(first.minSpeedMBps * 8).toFixed(2))
+      ;($('taskMinSpeed') as HTMLInputElement).value = String(first.minSpeedMBps)
       $('taskScanSummary').textContent = scanParamsSummary(first.scan)
       // 内置任务的名字**不可改** ——
       // 「亚洲组_IPv4」这个名字本身就是它在扫什么的唯一线索。
@@ -3230,8 +3230,7 @@ import { bindKwrtUpdate } from './kwrt-update'
     ).value.trim()
     const intervalDays = Number(($('taskInterval') as HTMLInputElement).value) || 0
     const runAt = ($('taskRunAt') as HTMLInputElement).value.trim()
-    const minSpeedMbps = Number(($('taskMinSpeed') as HTMLInputElement).value) || 0
-    const minSpeedMBps = minSpeedMbps / 8 // 界面用 Mb/s，内核按 MB/s
+    const minSpeedMBps = Number(($('taskMinSpeed') as HTMLInputElement).value) || 0
 
     if (!name) {
       showTaskWarn('任务名称不能为空', true)
@@ -3286,7 +3285,7 @@ import { bindKwrtUpdate } from './kwrt-update'
           description,
           intervalDays: String(intervalDays),
           runAt,
-          minSpeedMBps: String(minSpeedMbps),
+          minSpeedMBps: String(minSpeedMBps),
         }
         const targetId = taskEditId ?? Array.from(scheduledChecked)[0] ?? ''
         if (!targetId) {
@@ -3305,7 +3304,7 @@ import { bindKwrtUpdate } from './kwrt-update'
         }
         if (now.runAt !== taskModalOrigin.runAt) patch.runAt = now.runAt
         if (now.minSpeedMBps !== taskModalOrigin.minSpeedMBps) {
-          patch.minSpeedMBps = Number(now.minSpeedMBps) / 8
+          patch.minSpeedMBps = Number(now.minSpeedMBps)
         }
         if (Object.keys(patch).length === 1) {
           showTaskWarn('没有改动任何字段', true)
@@ -3642,12 +3641,12 @@ import { bindKwrtUpdate } from './kwrt-update'
           // （实测 1 条 0.12、3 条 0.47、8 条 1.15 MB/s），界面不再提供输入框
           speedConnections: 8,
           speedDurationMs: (Number($('optSpeedDur').value) || 6) * 1000,
-          // 最低下行速度：界面用 Mb/s，内核按 MB/s（÷8）；低于它的 IP 直接淘汰，不进结果/优选池。
+          // 最低下行速度（MB/s）：低于它的 IP 直接淘汰，不进结果/优选池。
           // 跳过测速时速度恒为 0，不能带下限，否则全部被淘汰。
           minSpeedMBps:
             (($('optSpeedMode') as unknown as HTMLSelectElement | null)?.value ?? 'two') === 'off'
               ? 0
-              : Math.max(0, Number(($('optMinSpeedMbps') as HTMLInputElement | null)?.value) || 0) / 8,
+              : Math.max(0, Number(($('optMinSpeedMBps') as HTMLInputElement | null)?.value) || 0),
           // 地址族：默认 auto（后端先做 IPv6 环境预检，通了才让 v6 参与）
           family: readOptFamily(),
           // ⚠️ 必须把「不回填」勾选状态传给后端
@@ -4070,7 +4069,7 @@ import { bindKwrtUpdate } from './kwrt-update'
       { label: '机房', key: 'colo' },
       { label: 'TLS(ms)', key: 'tls' },
       { label: 'TCP(ms)', key: 'tcp' },
-      { label: '下行(Mb/s)', key: 'speed' },
+      { label: '下行(MB/s)', key: 'speed' },
       { label: '最近复测', key: null },
       { label: '质量报告', key: null },
       { label: '操作', key: null },
@@ -4127,7 +4126,7 @@ import { bindKwrtUpdate } from './kwrt-update'
       tr.appendChild(tdCheck)
 
       // 跳过测速的会话速度本就是 0，显示 — 而不是 0
-      const speed = sess.skipSpeed ? '—' : (e.speed * 8).toFixed(2)
+      const speed = sess.skipSpeed ? '—' : String(e.speed)
       const tls = e.tlsMs > 0 ? String(e.tlsMs) : '—'
       // 机房列显示「SIN新加坡」——与可复制结果的备注一致
       const colo = e.colo ? e.colo + (e.city || '') : '—'

@@ -10,7 +10,16 @@ cd "$SRC"
 
 BASEVER="$(node -p "require('./package.json').version")"
 SHA="$(git rev-parse --short=7 HEAD)"
-VER="${BASEVER}+${SHA}"
+# 版本号 = 上游版本的「次版本」+ 递增的第三位，例如 0.50.25，路由器 / 桌面版 / 内核三处完全一致、不带 +编号。
+# 第三位 = 上游版本号第三位 + 本分支领先上游的提交数（每次有新提交就 +1，上游发新版也会跟着涨）。
+MAJMIN="${BASEVER%.*}"; PATCH0="${BASEVER##*.}"
+UPREF=""
+for r in refs/remotes/upstream/main refs/heads/main; do
+  if git rev-parse -q --verify "$r" >/dev/null 2>&1; then UPREF="$r"; break; fi
+done
+AHEAD=0
+[ -n "$UPREF" ] && AHEAD="$(git rev-list --count "$UPREF..HEAD" 2>/dev/null || echo 0)"
+VER="${MAJMIN}.$((PATCH0 + AHEAD))"
 echo "构建版本：$VER"
 
 echo "::group::安装依赖"

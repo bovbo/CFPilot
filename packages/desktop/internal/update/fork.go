@@ -7,7 +7,7 @@ package update
 //
 // 约定（由工作流 kwrt-sync-build.yml 发布到 Release `kwrt-latest`）：
 //
-//	VERSION-windows                    一行版本号，例如 0.50.0+8a75a5d
+//	VERSION-windows                    一行版本号，例如 0.50.23
 //	cfpilot-windows-amd64.exe          程序本体
 //	SHA256SUMS-desktop                 摘要清单（下载时强制校验，沿用上游的校验流程）
 //
@@ -72,7 +72,7 @@ func forkCheck(ctx context.Context, current string) *CheckResult {
 	res.Latest = latest
 	res.DownloadURL = base + "/cfpilot-windows-amd64.exe"
 	res.Notes = "来自你自己仓库的发布（含上游最新更新）。"
-	// 版本号带提交号（0.50.0+8a75a5d），不能只比数字：只要不一样就算有新版。
+	// 版本号形如 0.50.23（第三位随提交递增）：只要和当前不一样就算有新版。
 	res.HasUpdate = latest != strings.TrimSpace(current)
 	return res
 }
