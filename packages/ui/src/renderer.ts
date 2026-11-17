@@ -4066,6 +4066,7 @@ import { bindKwrtUpdate } from './kwrt-update'
       { label: '下行(MB/s)', key: 'speed' },
       { label: '最近复测', key: null },
       { label: '质量报告', key: null },
+      { label: '操作', key: null },
     ]
     for (const { label, key } of historyThKeys) {
       const th = document.createElement('th')
@@ -4165,11 +4166,32 @@ import { bindKwrtUpdate } from './kwrt-update'
       reportButton.title = '查看已保存的质量报告（只读）；要补测证据请用报告里的「重新检测此 IP」'
       tdReport.appendChild(reportButton)
       tr.appendChild(tdReport)
+
+      // 单个删除：只删这一个 IP（整批删除用会话标题行右侧的「删除」）
+      const tdDel = document.createElement('td')
+      const delOne = document.createElement('button')
+      delOne.type = 'button'
+      delOne.className = 'btn'
+      delOne.textContent = '删除'
+      delOne.title = '只删除这一个 IP（不影响同批其它 IP）'
+      delOne.addEventListener('click', async () => {
+        try {
+          const r = await window.cfpilot.deleteScanHistoryEntry(sess.id, e.ip, e.port)
+          if (r && r.ok === false) throw new Error(r.error || '未知错误')
+          historyChecked.delete(historyKey(e.ip, e.port))
+          log('已删除 ' + e.ip + ':' + e.port, 'ok')
+        } catch (err) {
+          log('删除失败：' + (err instanceof Error ? err.message : String(err)), 'err')
+        }
+        await loadScanHistory()
+      })
+      tdDel.appendChild(delOne)
+      tr.appendChild(tdDel)
       tbody.appendChild(tr)
       const reportRow = document.createElement('tr')
       reportRow.hidden = true
       const reportCell = document.createElement('td')
-      reportCell.colSpan = 9
+      reportCell.colSpan = 10
       reportCell.style.whiteSpace = 'normal'
       reportRow.appendChild(reportCell)
       tbody.appendChild(reportRow)

@@ -987,6 +987,11 @@
       return call('DELETE', '/api/scan/history?id=' + encodeURIComponent(id || ''))
     },
 
+    /** 只删除某条历史里的一个 IP */
+    deleteScanHistoryEntry: function (id, ip, port) {
+      return call('DELETE', '/api/scan/history?id=' + encodeURIComponent(id || '') + '&ip=' + encodeURIComponent(ip || '') + '&port=' + encodeURIComponent(port || 443))
+    },
+
     /* ---------------- 定时优选任务 ---------------- */
 
     /**

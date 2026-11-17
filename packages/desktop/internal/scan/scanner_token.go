@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/netfix"
 	"io"
 	"net/http"
 	"strings"
@@ -78,6 +79,7 @@ func FetchScannerToken(ctx context.Context, baseURL, password string, timeout ti
 		Timeout: timeout,
 		Transport: &http.Transport{
 			Proxy:               http.ProxyFromEnvironment,
+			DialContext:         netfix.DialContext,
 			MaxIdleConnsPerHost: 4,
 			IdleConnTimeout:     30 * time.Second,
 			TLSHandshakeTimeout: 15 * time.Second,
@@ -111,6 +113,12 @@ func FetchScannerToken(ctx context.Context, baseURL, password string, timeout ti
 	loginReq.Header.Set("Content-Type", "application/json")
 
 	loginRes, err := client.Do(loginReq)
+	for try := 0; err != nil && try < 2 && ctx.Err() == nil; try++ { // 网络抖动：最多再试 2 次
+		time.Sleep(time.Second)
+		loginReq2 := loginReq.Clone(ctx)
+		loginReq2.Body = io.NopCloser(bytes.NewReader(loginBody))
+		loginRes, err = client.Do(loginReq2)
+	}
 	if err != nil {
 		return TokenResult{Error: "登录请求失败：" + err.Error()}
 	}

@@ -541,6 +541,7 @@ interface Window {
       error?: string
     }>
     /** 删除一条优选历史会话 */
+    deleteScanHistoryEntry(id: string, ip: string, port: number): Promise<{ ok: boolean; error?: string }>
     deleteScanHistory(id: string): Promise<{ ok: boolean; error?: string }>
 
     /* ---------------- 定时优选任务 ---------------- */

@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -92,6 +93,18 @@ func (s *Server) handleScanHistory(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimSpace(r.URL.Query().Get("id"))
 		if id == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "缺少 id 参数"})
+			return
+		}
+		if ip := strings.TrimSpace(r.URL.Query().Get("ip")); ip != "" {
+			port, _ := strconv.Atoi(r.URL.Query().Get("port"))
+			if port <= 0 {
+				port = 443
+			}
+			if err := s.historyStore().DeleteEntry(id, ip, port); err != nil {
+				writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "删除失败：" + err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 			return
 		}
 		if err := s.historyStore().Delete(id); err != nil {

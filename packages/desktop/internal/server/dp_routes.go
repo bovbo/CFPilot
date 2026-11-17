@@ -37,6 +37,12 @@ func (s *Server) registerDPRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/dp/fixed/test", s.guard(s.handleDPFixedTest))
 }
 
+var dpPoolErrLog struct {
+	sync.Mutex
+	msg string
+	at  time.Time
+}
+
 var dpFixedTesting struct {
 	sync.Mutex
 	on bool
@@ -148,6 +154,14 @@ func (s *Server) handleDPList(w http.ResponseWriter, r *http.Request) {
 		} else {
 			pools = m
 		}
+	}
+	if poolErr != "" { // 错误也写进日志文件（10 分钟内相同错误只记一次，避免轮询刷屏）
+		dpPoolErrLog.Lock()
+		if dpPoolErrLog.msg != poolErr || time.Since(dpPoolErrLog.at) > 10*time.Minute {
+			dpPoolErrLog.msg, dpPoolErrLog.at = poolErr, time.Now()
+			s.logLevel("读取各数据面池条数失败："+poolErr, "warn")
+		}
+		dpPoolErrLog.Unlock()
 	}
 	dpPushing.Lock()
 	pushing := dpPushing.on

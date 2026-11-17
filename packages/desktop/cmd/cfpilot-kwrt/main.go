@@ -22,6 +22,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/netfix"
 	"io"
 	"log"
 	"net"
@@ -47,6 +48,7 @@ var Version = "dev"
 func main() {
 	// 只用内置内核（含多数据面接口），不换成上游发布的远程内核
 	kernel.DisableRemote = true
+	netfix.Install()
 	var (
 		portFlag    = flag.Int("port", 0, "监听端口（覆盖配置，仅本次生效）")
 		dataDir     = flag.String("data-dir", "", "数据目录（凭据 / 配置 / 日志）")

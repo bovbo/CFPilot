@@ -26,6 +26,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/netfix"
 	"io"
 	"log"
 	"net"
@@ -131,6 +132,7 @@ func main() {
 	// 3. 更新从自己仓库的 Release 取，不会被「升级」成上游版本。
 	portableRes := portable.Setup()
 	kernel.DisableRemote = true
+	netfix.Install()
 	if strings.TrimSpace(UpdateBase) != "" {
 		update.UseFork(UpdateBase)
 	}

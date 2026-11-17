@@ -671,6 +671,7 @@ func (s *Server) handleScanPushResults(w http.ResponseWriter, r *http.Request) {
 	// ---- 2. 现取临时令牌 ----
 	tok := scan.FetchScannerToken(ctx, host, password, 25*time.Second)
 	if !tok.OK {
+		s.logLevel("✗ 回填失败（取令牌）："+tok.Error, "err")
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": tok.Error})
 		return
 	}
@@ -687,6 +688,7 @@ func (s *Server) handleScanPushResults(w http.ResponseWriter, r *http.Request) {
 	url := scan.DefaultCallbackURL(host)
 	res := scan.PostResultsTo(ctx, url, tok.Token, req.Lines, req.Mode, target, 20*time.Second)
 	if !res.OK {
+		s.logLevel("✗ 回填失败："+res.Error, "err")
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":    false,
 			"error": "回填失败：" + res.Error,

@@ -281,6 +281,33 @@ func (s *Store) Delete(id string) error {
 	return s.write(kept)
 }
 
+// DeleteEntry 只删除某会话里的一个 IP:Port；删完后会话没有条目了就整条删掉。
+func (s *Store) DeleteEntry(id, ip string, port int) error {
+	historyMu.Lock()
+	defer historyMu.Unlock()
+	list, err := s.load()
+	if err != nil {
+		return err
+	}
+	out := make([]Session, 0, len(list))
+	for _, sess := range list {
+		if sess.ID == id {
+			kept := make([]Entry, 0, len(sess.Entries))
+			for _, e := range sess.Entries {
+				if !(e.IP == ip && e.Port == port) {
+					kept = append(kept, e)
+				}
+			}
+			if len(kept) == 0 {
+				continue
+			}
+			sess.Entries = kept
+		}
+		out = append(out, sess)
+	}
+	return s.write(out)
+}
+
 // UpdateEntryLastTest 把某会话里某个 IP:Port 的最近一次复测结论写回去。
 //
 // 多选项复测时，前端把每个 IP 的复测结果传回来，这里按 ip+port 定位条目更新。
